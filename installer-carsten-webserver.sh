@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Carsten Webpanel - one-file installer for Ubuntu 22.04/24.04/26.04.
+# Carsten Webpanel v1.1 - one-file installer for Ubuntu 22.04/24.04/26.04.
 # Run with: sudo bash installer-carsten-webserver.sh
 
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
@@ -22,6 +22,28 @@ SITE_ROOT="/srv/carsten-sites"
 PANEL_PORT="9090"
 ADMIN_USER="${PANEL_USER_NAME:-admin}"
 ADMIN_PASSWORD="${PANEL_PASSWORD:-}"
+
+if [[ -z "$ADMIN_PASSWORD" && -t 0 ]]; then
+  echo ""
+  echo "Vælg den adgangskode, du vil bruge til dashboardet."
+  while true; do
+    read -r -s -p "Ny adgangskode (mindst 8 tegn): " FIRST_PASSWORD
+    echo ""
+    if (( ${#FIRST_PASSWORD} < 8 )); then
+      echo "Adgangskoden skal være på mindst 8 tegn. Prøv igen."
+      continue
+    fi
+    read -r -s -p "Skriv adgangskoden igen: " SECOND_PASSWORD
+    echo ""
+    if [[ "$FIRST_PASSWORD" != "$SECOND_PASSWORD" ]]; then
+      echo "De to adgangskoder var ikke ens. Prøv igen."
+      continue
+    fi
+    ADMIN_PASSWORD="$FIRST_PASSWORD"
+    unset FIRST_PASSWORD SECOND_PASSWORD
+    break
+  done
+fi
 
 echo "[1/7] Installerer Nginx, Python og nødvendige pakker..."
 apt-get update
@@ -75,6 +97,7 @@ def nginx_config(site):
     slug, port, domains = validate(site)
     names = " ".join(domains) if domains else "_"
     default = " default_server" if not domains else ""
+    domain_listeners = "\n    listen 80;\n    listen [::]:80;" if domains else ""
     access = ""
     if site["scope"] == "lan":
         access = """
@@ -88,7 +111,7 @@ def nginx_config(site):
     return f'''# Managed by Carsten Webpanel - do not edit manually
 server {{
     listen {port}{default};
-    listen [::]:{port}{default};
+    listen [::]:{port}{default};{domain_listeners}
     server_name {names};
     root {ROOT / slug / "public"};
     index index.html index.htm;
@@ -114,7 +137,7 @@ def main():
     if not isinstance(sites, list): fail("Website-listen er ødelagt")
 
     used_defaults = set()
-    used_domain_ports = set()
+    used_domains = set()
     wanted = set()
     for site in sites:
         slug, port, domains = validate(site)
@@ -124,9 +147,8 @@ def main():
             if port in used_defaults: fail(f"Flere websites uden domæne bruger port {port}")
             used_defaults.add(port)
         for domain in domains:
-            key = (port, domain)
-            if key in used_domain_ports: fail(f"Domænet {domain} bruges to gange på port {port}")
-            used_domain_ports.add(key)
+            if domain in used_domains: fail(f"Domænet {domain} bruges af flere websites")
+            used_domains.add(domain)
         target = OUT / f"{slug}.conf"
         content = nginx_config(site)
         fd, tmp = tempfile.mkstemp(prefix=f".{slug}.", dir=OUT, text=True)
@@ -158,6 +180,8 @@ def main():
                 else:
                     for subnet in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"):
                         subprocess.run([str(ufw), "allow", "from", subnet, "to", "any", "port", str(port), "proto", "tcp", "comment", "Carsten LAN site"], check=True, stdout=subprocess.DEVNULL)
+            if any(s.get("active", True) and s["scope"] == "public" and s.get("domains") for s in sites):
+                subprocess.run([str(ufw), "allow", "80/tcp", "comment", "Carsten public domains"], check=True, stdout=subprocess.DEVNULL)
 
 if __name__ == "__main__":
     main()
@@ -279,7 +303,7 @@ def dashboard():
     used = shutil.disk_usage(ROOT)
     body = '''<div class="top"><div><h1>Dine websites</h1><div class="muted">Administrér alt fra ét sted</div></div><a class="button" href="{{ url_for('new_site') }}">＋ Nyt website</a></div>
     <div class="grid"><div class="stat"><span class="muted">Websites</span><div class="big">{{ sites|length }}</div></div><div class="stat"><span class="muted">Online</span><div class="big">{{ sites|selectattr('active')|list|length }}</div></div><div class="stat"><span class="muted">Server-IP</span><div class="big" style="font-size:18px">{{ ip }}</div></div><div class="stat"><span class="muted">Ledig disk</span><div class="big">{{ free }} GB</div></div></div>
-    <div class="sites">{% for s in sites %}<article class="site"><div class="row"><div><h3>{{ s.name }}</h3><span class="muted">Port {{ s.port }}</span></div><span class="pill {{ 'on' if s.active else 'off' }}">{{ 'ONLINE' if s.active else 'STOPPET' }}</span></div><div class="domain">{% if s.domains %}{{ s.domains|join(', ') }}{% else %}{{ ip }}:{{ s.port }}{% endif %}</div><div class="row"><span class="pill {{ 'lan' if s.scope == 'lan' else 'on' }}">{{ 'Kun netværk' if s.scope == 'lan' else 'Offentlig' }}</span><span class="muted">{{ s.updated[:10] }}</span></div><div class="actions"><a class="button secondary" href="{{ url_for('edit_site', slug=s.slug) }}">Redigér</a><a class="button secondary" href="http://{{ (s.domains[0] if s.domains else ip) }}:{{ s.port }}" target="_blank">Åbn</a><form method="post" action="{{ url_for('toggle_site', slug=s.slug) }}"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><button class="secondary">{{ 'Stop' if s.active else 'Start' }}</button></form><form method="post" action="{{ url_for('delete_site', slug=s.slug) }}" onsubmit="return confirm('Flyt websitet til backup og fjern det?')"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><button class="danger">Slet</button></form></div></article>{% else %}<div class="card empty"><h2>Ingen websites endnu</h2><p>Opret dit første website på under ét minut.</p><a class="button" href="{{ url_for('new_site') }}">Opret website</a></div>{% endfor %}</div>'''
+    <div class="sites">{% for s in sites %}<article class="site"><div class="row"><div><h3>{{ s.name }}</h3><span class="muted">Port {{ s.port }}</span></div><span class="pill {{ 'on' if s.active else 'off' }}">{{ 'ONLINE' if s.active else 'STOPPET' }}</span></div><div class="domain">{% if s.domains %}{{ s.domains|join(', ') }}{% else %}{{ ip }}:{{ s.port }}{% endif %}</div><div class="row"><span class="pill {{ 'lan' if s.scope == 'lan' else 'on' }}">{{ 'Kun netværk' if s.scope == 'lan' else 'Offentlig' }}</span><span class="muted">{{ s.updated[:10] }}</span></div><div class="actions"><a class="button secondary" href="{{ url_for('edit_site', slug=s.slug) }}">Redigér</a><a class="button secondary" href="http://{% if s.domains %}{{ s.domains[0] }}{% else %}{{ ip }}:{{ s.port }}{% endif %}" target="_blank">Åbn</a><form method="post" action="{{ url_for('toggle_site', slug=s.slug) }}"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><button class="secondary">{{ 'Stop' if s.active else 'Start' }}</button></form><form method="post" action="{{ url_for('delete_site', slug=s.slug) }}" onsubmit="return confirm('Flyt websitet til backup og fjern det?')"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><button class="danger">Slet</button></form></div></article>{% else %}<div class="card empty"><h2>Ingen websites endnu</h2><p>Opret dit første website på under ét minut.</p><a class="button" href="{{ url_for('new_site') }}">Opret website</a></div>{% endfor %}</div>'''
     return page("Websites", body, sites=sites, ip=ip, free=round(used.free/1024**3, 1))
 
 def parse_domains(raw):
@@ -305,7 +329,7 @@ def validate_site_form(existing_slug=None):
     for other in sites:
         if other["slug"] == slug: continue
         if not domains and not other["domains"] and other["port"] == port: raise ValueError("Porten bruges allerede af et website uden domæne")
-        if other["port"] == port and set(domains) & set(other["domains"]): raise ValueError("Domænet bruges allerede på denne port")
+        if set(domains) & set(other["domains"]): raise ValueError("Domænet bruges allerede af et andet website")
     return name, slug, port, scope, domains
 
 @app.route("/sites/new", methods=["GET", "POST"])
@@ -441,7 +465,7 @@ def system():
     try:
         seconds=float(Path("/proc/uptime").read_text().split()[0]); uptime=f"{int(seconds//86400)} dage, {int(seconds%86400//3600)} timer"
     except OSError: pass
-    body='''<div class="top"><div><h1>Serverinfo</h1><div class="muted">Status og næste skridt</div></div></div><div class="grid"><div class="stat"><span class="muted">Lokal IP</span><div class="big" style="font-size:18px">{{ ip }}</div></div><div class="stat"><span class="muted">Dashboard</span><div class="big">9090</div></div><div class="stat"><span class="muted">Oppetid</span><div class="big" style="font-size:18px">{{ uptime }}</div></div><div class="stat"><span class="muted">Aktive sites</span><div class="big">{{ sites|selectattr('active')|list|length }}</div></div></div><section class="card"><h2>Sådan gør du et website offentligt</h2><p>1. Vælg <b>Offentlig</b> på websitet.</p><p>2. Port-forward websitets valgte TCP-port i din router til <b>{{ ip }}</b>.</p><p>3. Hvis du bruger et domæne, skal domænets A-record pege på din offentlige IP.</p><p class="muted">Din internetudbyder kan bruge CGNAT. I så fald virker almindelig port-forwarding ikke, og du skal bruge fx Cloudflare Tunnel.</p></section><section class="card"><h2>Nyttige kommandoer</h2><div class="domain">sudo systemctl status carsten-webpanel<br>sudo journalctl -u carsten-webpanel -f<br>sudo nginx -t</div></section>'''
+    body='''<div class="top"><div><h1>Serverinfo</h1><div class="muted">Status og næste skridt</div></div></div><div class="grid"><div class="stat"><span class="muted">Lokal IP</span><div class="big" style="font-size:18px">{{ ip }}</div></div><div class="stat"><span class="muted">Dashboard</span><div class="big">Port 80 / 9090</div></div><div class="stat"><span class="muted">Oppetid</span><div class="big" style="font-size:18px">{{ uptime }}</div></div><div class="stat"><span class="muted">Aktive sites</span><div class="big">{{ sites|selectattr('active')|list|length }}</div></div></div><section class="card"><h2>Sådan gør du et website offentligt</h2><p>1. Vælg <b>Offentlig</b> på websitet.</p><p>2. Uden domæne: port-forward websitets valgte TCP-port til <b>{{ ip }}</b>.</p><p>3. Med domæne: port-forward TCP-port 80, og lad domænets A-record pege på din offentlige IP.</p><p class="muted">Din internetudbyder kan bruge CGNAT. I så fald virker almindelig port-forwarding ikke, og du skal bruge fx Cloudflare Tunnel.</p></section><section class="card"><h2>Automatisk opstart</h2><p>Dashboardet og alle websites, der står som <b>ONLINE</b>, starter automatisk efter en nedlukning eller genstart. Du skal ikke skrive nogen kommando.</p></section><section class="card"><h2>Nyttige kommandoer</h2><div class="domain">sudo systemctl status carsten-webpanel<br>sudo journalctl -u carsten-webpanel -f<br>sudo nginx -t</div></section>'''
     return page("Serverinfo",body,ip=ip,uptime=uptime,sites=sites)
 
 @app.get("/health")
@@ -468,6 +492,8 @@ NGINXINCLUDE
 rm -f /etc/nginx/sites-enabled/default
 cat > /etc/nginx/sites-available/carsten-panel <<NGINXPANEL
 server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
     listen ${PANEL_PORT};
     listen [::]:${PANEL_PORT};
     server_name _;
@@ -503,8 +529,9 @@ Type=simple
 User=${PANEL_USER}
 Group=${PANEL_USER}
 WorkingDirectory=${PANEL_HOME}
+ExecStartPre=/usr/bin/sudo /usr/local/sbin/carsten-panel-apply
 ExecStart=/usr/bin/gunicorn --workers 2 --threads 4 --bind 127.0.0.1:9080 --access-logfile - app:app
-Restart=on-failure
+Restart=always
 RestartSec=3
 PrivateTmp=true
 ProtectSystem=full
@@ -525,14 +552,39 @@ echo "[6/7] Tester opsætningen..."
 python3 -m py_compile "$PANEL_HOME/app.py" /usr/local/sbin/carsten-panel-apply
 /usr/sbin/nginx -t
 systemctl daemon-reload
-systemctl enable --now nginx carsten-webpanel
+systemctl enable nginx carsten-webpanel
+systemctl restart nginx
+systemctl restart carsten-webpanel
 
 # If UFW is already active, allow the panel from private IPv4 networks without changing SSH rules.
 if command -v ufw >/dev/null 2>&1 && ufw status | grep -q '^Status: active'; then
+  ufw allow from 10.0.0.0/8 to any port 80 proto tcp comment 'Carsten panel' >/dev/null || true
+  ufw allow from 172.16.0.0/12 to any port 80 proto tcp comment 'Carsten panel' >/dev/null || true
+  ufw allow from 192.168.0.0/16 to any port 80 proto tcp comment 'Carsten panel' >/dev/null || true
   ufw allow from 10.0.0.0/8 to any port "$PANEL_PORT" proto tcp comment 'Carsten panel' >/dev/null || true
   ufw allow from 172.16.0.0/12 to any port "$PANEL_PORT" proto tcp comment 'Carsten panel' >/dev/null || true
   ufw allow from 192.168.0.0/16 to any port "$PANEL_PORT" proto tcp comment 'Carsten panel' >/dev/null || true
 fi
+
+PANEL_OK=false
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  if curl --silent --fail --max-time 2 http://127.0.0.1/health | grep -q '"ok":true'; then
+    PANEL_OK=true
+    break
+  fi
+  sleep 1
+done
+if [[ "$PANEL_OK" != true ]]; then
+  echo ""
+  echo "FEJL: Dashboardet startede ikke korrekt. Her er fejlen:"
+  journalctl -u carsten-webpanel --no-pager -n 30 || true
+  exit 1
+fi
+
+systemctl is-enabled --quiet nginx
+systemctl is-enabled --quiet carsten-webpanel
+systemctl is-active --quiet nginx
+systemctl is-active --quiet carsten-webpanel
 
 echo "[7/7] Færdig!"
 LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
@@ -544,14 +596,16 @@ cat <<DONE
 ║                 CARSTEN WEBSERVER ER KLAR                   ║
 ╚══════════════════════════════════════════════════════════════╝
 
-Dashboard:   http://${LAN_IP}:${PANEL_PORT}
+Dashboard:   http://${LAN_IP}
+Alternativ:  http://${LAN_IP}:${PANEL_PORT}
 Brugernavn:  ${ADMIN_USER}
 Adgangskode: ${ADMIN_PASSWORD}
 
 GEM ADGANGSKODEN NU. Den vises kun under installationen.
 
 Åbn dashboardet fra en computer eller mobil på samme netværk.
-Serveren og dashboardet starter automatisk, når Ubuntu starter.
+Du skal ikke køre flere kommandoer efter en genstart.
+Dashboardet og alle aktive hjemmesider starter automatisk med Ubuntu.
 
 Status: sudo systemctl status carsten-webpanel
 Logs:   sudo journalctl -u carsten-webpanel -f
