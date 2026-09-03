@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# NexusHost Webpanel v2.0 - one-file installer for Ubuntu 22.04/24.04/26.04.
+# NexusHost Webpanel v2.1 - one-file installer for Ubuntu 22.04/24.04/26.04.
 # Run with: sudo bash installer-nexushost.sh
 
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
@@ -531,6 +531,8 @@ chown root:root "$PANEL_HOME/app.py"
 chmod 0644 "$PANEL_HOME/app.py"
 
 echo "[4/7] Konfigurerer Nginx..."
+LAN_IP="$(hostname -I 2>/dev/null | tr ' ' '\n' | awk '/^[0-9]+\./ {print; exit}')"
+LAN_IP="${LAN_IP:-127.0.0.1}"
 install -d -o root -g root -m 0755 /etc/nginx/nexushost-sites
 cat > /etc/nginx/conf.d/nexushost-sites.conf <<'NGINXINCLUDE'
 include /etc/nginx/nexushost-sites/*.conf;
@@ -538,11 +540,11 @@ NGINXINCLUDE
 rm -f /etc/nginx/sites-enabled/default
 cat > /etc/nginx/sites-available/nexushost-panel <<NGINXPANEL
 server {
-    listen 80 default_server;
-    listen [::]:80 default_server;
+    listen 80;
+    listen [::]:80;
     listen ${PANEL_PORT};
     listen [::]:${PANEL_PORT};
-    server_name _;
+    server_name localhost 127.0.0.1 ${LAN_IP};
     allow 127.0.0.1;
     allow 10.0.0.0/8;
     allow 172.16.0.0/12;
@@ -649,8 +651,6 @@ fi
 systemctl daemon-reload
 
 echo "[7/7] Færdig!"
-LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
-LAN_IP="${LAN_IP:-127.0.0.1}"
 
 cat <<DONE
 
