@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# NexusHost Webpanel v2.2 - one-file installer for Ubuntu 22.04/24.04/26.04.
+# NexusHost Webpanel v3.0 - one-file installer for Ubuntu 22.04/24.04/26.04.
 # Run with: sudo bash installer-nexushost.sh
 
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
@@ -16,9 +16,11 @@ fi
 
 export DEBIAN_FRONTEND=noninteractive
 PANEL_USER="nexushost-panel"
+TUNNEL_USER="nexushost-tunnel"
 PANEL_HOME="/opt/nexushost-webpanel"
 DATA_DIR="/var/lib/nexushost-webpanel"
 SITE_ROOT="/srv/nexushost-sites"
+TUNNEL_DIR="/etc/nexushost"
 PANEL_PORT="9090"
 ADMIN_USER="${PANEL_USER_NAME:-admin}"
 ADMIN_PASSWORD="${PANEL_PASSWORD:-}"
@@ -47,10 +49,61 @@ fi
 
 echo "[1/7] Installerer Nginx, Python og nødvendige pakker..."
 apt-get update
-apt-get install -y nginx python3 python3-flask python3-gunicorn unzip openssl curl sudo
+apt-get install -y nginx python3 python3-flask python3-gunicorn unzip openssl curl ca-certificates sudo
 if [[ -z "$ADMIN_PASSWORD" ]]; then
   ADMIN_PASSWORD="$(openssl rand -base64 24 | tr -d '\n' | tr '/+' 'xy')"
 fi
+
+# Tilføj Cloudflares officielle pakkearkiv, så cloudflared også får opdateringer
+# gennem Ubuntus normale apt-opdateringer. Hvis arkivet er utilgængeligt, bruges
+# den officielle release-pakke som reserve.
+if ! command -v cloudflared >/dev/null 2>&1; then
+  install -d -o root -g root -m 0755 /usr/share/keyrings
+  CF_KEY="$(mktemp)"
+  CF_REPO_READY=false
+  if curl --fail --silent --show-error --location --retry 3 --connect-timeout 20 \
+    https://pkg.cloudflare.com/cloudflare-main.gpg --output "$CF_KEY"; then
+    install -o root -g root -m 0644 "$CF_KEY" /usr/share/keyrings/cloudflare-main.gpg
+    printf '%s\n' 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main' \
+      > /etc/apt/sources.list.d/cloudflared.list
+    if apt-get update && apt-get install -y cloudflared; then
+      CF_REPO_READY=true
+    fi
+  fi
+  rm -f -- "$CF_KEY"
+
+  if [[ "$CF_REPO_READY" != true ]]; then
+    CF_ARCH="$(dpkg --print-architecture)"
+    case "$CF_ARCH" in
+      amd64) CF_PACKAGE="cloudflared-linux-amd64.deb" ;;
+      arm64) CF_PACKAGE="cloudflared-linux-arm64.deb" ;;
+      armhf) CF_PACKAGE="cloudflared-linux-arm.deb" ;;
+      *)
+        echo "FEJL: Cloudflare Tunnel understøttes ikke automatisk på arkitekturen: $CF_ARCH"
+        exit 1
+        ;;
+    esac
+    CF_DEB="$(mktemp --suffix=.deb)"
+    if ! curl --fail --location --retry 3 --connect-timeout 20 \
+      "https://github.com/cloudflare/cloudflared/releases/latest/download/${CF_PACKAGE}" \
+      --output "$CF_DEB"; then
+      rm -f -- "$CF_DEB"
+      echo "FEJL: Cloudflared kunne ikke downloades. Kontrollér internetforbindelsen og prøv igen."
+      exit 1
+    fi
+    apt-get install -y "$CF_DEB"
+    rm -f -- "$CF_DEB"
+  fi
+fi
+if command -v cloudflared >/dev/null 2>&1 && apt-cache show cloudflared >/dev/null 2>&1; then
+  apt-get install -y --only-upgrade cloudflared || true
+fi
+CLOUDFLARED_BIN="$(command -v cloudflared 2>/dev/null || true)"
+if [[ -z "$CLOUDFLARED_BIN" ]]; then
+  echo "FEJL: Cloudflared blev installeret, men programmet kunne ikke findes."
+  exit 1
+fi
+echo "Cloudflare Tunnel fundet: $($CLOUDFLARED_BIN --version 2>&1 | head -n 1)"
 
 # Ubuntu-versioner bruger enten navnet gunicorn eller gunicorn3.
 GUNICORN_START="$(command -v gunicorn 2>/dev/null || command -v gunicorn3 2>/dev/null || true)"
@@ -67,56 +120,20 @@ echo "Gunicorn fundet: $GUNICORN_START"
 if ! id "$PANEL_USER" >/dev/null 2>&1; then
   useradd --system --home "$PANEL_HOME" --shell /usr/sbin/nologin "$PANEL_USER"
 fi
+if ! getent group "$TUNNEL_USER" >/dev/null 2>&1; then
+  groupadd --system "$TUNNEL_USER"
+fi
+if ! id "$TUNNEL_USER" >/dev/null 2>&1; then
+  useradd --system --gid "$TUNNEL_USER" --home "$TUNNEL_DIR" --shell /usr/sbin/nologin "$TUNNEL_USER"
+else
+  usermod --gid "$TUNNEL_USER" "$TUNNEL_USER"
+fi
 
 install -d -o root -g root -m 0755 "$PANEL_HOME"
 install -d -o "$PANEL_USER" -g "$PANEL_USER" -m 0750 "$DATA_DIR" "$DATA_DIR/backups"
 install -d -o "$PANEL_USER" -g "$PANEL_USER" -m 0755 "$SITE_ROOT"
-
-# Flyt automatisk data fra den tidligere udgave uden at vise det gamle navn igen.
-LEGACY_TAG="$(printf '\143\141\162\163\164\145\156')"
-LEGACY_USER="${LEGACY_TAG}-panel"
-LEGACY_HOME="/opt/${LEGACY_TAG}-webpanel"
-LEGACY_DATA="/var/lib/${LEGACY_TAG}-webpanel"
-LEGACY_SITE_ROOT="/srv/${LEGACY_TAG}-sites"
-LEGACY_SERVICE="${LEGACY_TAG}-webpanel"
-
-systemctl disable --now "$LEGACY_SERVICE" >/dev/null 2>&1 || true
-rm -f -- \
-  "/etc/nginx/sites-enabled/${LEGACY_TAG}-panel" \
-  "/etc/nginx/conf.d/${LEGACY_TAG}-sites.conf"
-
-if [[ -f "$LEGACY_DATA/sites.json" ]]; then
-  python3 - "$LEGACY_DATA/sites.json" "$DATA_DIR/sites.json" <<'PYMIGRATE'
-import json, os, sys
-old_path, new_path = sys.argv[1:]
-try:
-    with open(old_path) as handle:
-        old_sites = json.load(handle)
-except (OSError, json.JSONDecodeError):
-    old_sites = []
-try:
-    with open(new_path) as handle:
-        new_sites = json.load(handle)
-except (OSError, json.JSONDecodeError):
-    new_sites = []
-known = {site.get("slug") for site in new_sites if isinstance(site, dict)}
-for site in old_sites if isinstance(old_sites, list) else []:
-    if isinstance(site, dict) and site.get("slug") not in known:
-        new_sites.append(site)
-        known.add(site.get("slug"))
-temporary = new_path + ".migrate"
-with open(temporary, "w") as handle:
-    json.dump(new_sites, handle, ensure_ascii=False, indent=2)
-os.replace(temporary, new_path)
-PYMIGRATE
-fi
-if [[ -d "$LEGACY_SITE_ROOT" ]]; then
-  cp -a -n "$LEGACY_SITE_ROOT/." "$SITE_ROOT/"
-fi
-if [[ -d "$LEGACY_DATA/backups" ]]; then
-  cp -a -n "$LEGACY_DATA/backups/." "$DATA_DIR/backups/"
-fi
 chown -R "$PANEL_USER:$PANEL_USER" "$DATA_DIR" "$SITE_ROOT"
+install -d -o root -g "$TUNNEL_USER" -m 0750 "$TUNNEL_DIR"
 
 echo "[2/7] Opretter den sikre server-hjælper..."
 install -o root -g root -m 0755 /dev/null /usr/local/sbin/nexushost-panel-apply
@@ -141,7 +158,7 @@ def validate(site):
     port = site.get("port")
     if not isinstance(port, int) or not 1024 <= port <= 65535 or port == 9090:
         fail("Ugyldig port")
-    if site.get("scope") not in ("lan", "public"): fail("Ugyldig adgangstype")
+    if site.get("scope") not in ("lan", "tunnel", "public"): fail("Ugyldig adgangstype")
     domains = site.get("domains", [])
     if not isinstance(domains, list) or len(domains) > 20: fail("Ugyldige domæner")
     for domain in domains:
@@ -155,9 +172,9 @@ def nginx_config(site):
     slug, port, domains = validate(site)
     names = " ".join(domains) if domains else "_"
     default = " default_server" if not domains else ""
-    domain_listeners = "\n    listen 80;\n    listen [::]:80;" if domains else ""
+    domain_listeners = "\n    listen 80;\n    listen [::]:80;" if domains and site["scope"] == "public" else ""
     access = ""
-    if site["scope"] == "lan":
+    if site["scope"] in ("lan", "tunnel"):
         access = """
     allow 127.0.0.1;
     allow 10.0.0.0/8;
@@ -194,16 +211,15 @@ def main():
         fail(f"Kunne ikke læse website-listen: {exc}")
     if not isinstance(sites, list): fail("Website-listen er ødelagt")
 
-    used_defaults = set()
+    used_ports = set()
     used_domains = set()
     wanted = set()
     for site in sites:
         slug, port, domains = validate(site)
         if not site.get("active", True):
             continue
-        if not domains:
-            if port in used_defaults: fail(f"Flere websites uden domæne bruger port {port}")
-            used_defaults.add(port)
+        if port in used_ports: fail(f"Flere websites bruger port {port}")
+        used_ports.add(port)
         for domain in domains:
             if domain in used_domains: fail(f"Domænet {domain} bruges af flere websites")
             used_domains.add(domain)
@@ -229,23 +245,107 @@ def main():
     subprocess.run(["/bin/systemctl", "reload", "nginx"], check=True)
     ufw = Path("/usr/sbin/ufw")
     if ufw.exists():
-        status = subprocess.run([str(ufw), "status"], text=True, capture_output=True)
+        status = subprocess.run([str(ufw), "status", "numbered"], text=True, capture_output=True)
         if "Status: active" in status.stdout:
+            # Fjern kun regler, som tidligere er oprettet af website-hjælperen.
+            # Det lukker også en gammel offentlig port, hvis et site skifter til Tunnel/LAN.
+            managed_comments = (
+                "NexusHost public site", "NexusHost LAN site",
+                "NexusHost public domains", "NexusHost managed site",
+            )
+            rule_numbers = []
+            for line in status.stdout.splitlines():
+                if any(comment in line for comment in managed_comments):
+                    match = re.match(r"\[\s*(\d+)\]", line.strip())
+                    if match:
+                        rule_numbers.append(int(match.group(1)))
+            for number in sorted(set(rule_numbers), reverse=True):
+                subprocess.run([str(ufw), "--force", "delete", str(number)], check=True,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
             for port in sorted({s["port"] for s in sites if s.get("active", True)}):
-                is_public = any(s.get("active", True) and s["port"] == port and s["scope"] == "public" for s in sites)
-                if is_public:
-                    subprocess.run([str(ufw), "allow", f"{port}/tcp", "comment", "NexusHost public site"], check=True, stdout=subprocess.DEVNULL)
+                direct_public = any(
+                    s.get("active", True) and s["port"] == port and s["scope"] == "public"
+                    for s in sites
+                )
+                if direct_public:
+                    subprocess.run([str(ufw), "allow", f"{port}/tcp", "comment", "NexusHost managed site"],
+                                   check=True, stdout=subprocess.DEVNULL)
                 else:
                     for subnet in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"):
-                        subprocess.run([str(ufw), "allow", "from", subnet, "to", "any", "port", str(port), "proto", "tcp", "comment", "NexusHost LAN site"], check=True, stdout=subprocess.DEVNULL)
+                        subprocess.run([
+                            str(ufw), "allow", "from", subnet, "to", "any", "port", str(port),
+                            "proto", "tcp", "comment", "NexusHost managed site",
+                        ], check=True, stdout=subprocess.DEVNULL)
             if any(s.get("active", True) and s["scope"] == "public" and s.get("domains") for s in sites):
-                subprocess.run([str(ufw), "allow", "80/tcp", "comment", "NexusHost public domains"], check=True, stdout=subprocess.DEVNULL)
+                subprocess.run([str(ufw), "allow", "80/tcp", "comment", "NexusHost managed site"],
+                               check=True, stdout=subprocess.DEVNULL)
 
 if __name__ == "__main__":
     main()
 PYHELPER
 chmod 0755 /usr/local/sbin/nexushost-panel-apply
 chown root:root /usr/local/sbin/nexushost-panel-apply
+
+install -o root -g root -m 0755 /dev/null /usr/local/sbin/nexushost-tunnel-control
+cat > /usr/local/sbin/nexushost-tunnel-control <<'TUNNELHELPER'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+TOKEN_FILE="/etc/nexushost/tunnel-token"
+MARKER_FILE="/var/lib/nexushost-webpanel/tunnel-configured"
+SERVICE="nexushost-tunnel.service"
+
+fail() {
+  echo "FEJL: $1" >&2
+  exit 1
+}
+
+case "${1:-}" in
+  install)
+    [[ $# -eq 1 ]] || fail "Ugyldige argumenter"
+    TOKEN="$(head -c 4097)"
+    if (( ${#TOKEN} < 80 || ${#TOKEN} > 4096 )) || [[ ! "$TOKEN" =~ ^[A-Za-z0-9+/._=-]+$ ]]; then
+      fail "Cloudflare-tokenet ser ikke gyldigt ud. Kopiér hele Linux-kommandoen igen."
+    fi
+    if ! printf '%s' "$TOKEN" | python3 -c 'import base64,json,sys; data=json.loads(base64.b64decode(sys.stdin.buffer.read(), validate=True)); assert all(data.get(k) for k in ("a","s","t"))' 2>/dev/null; then
+      fail "Cloudflare-tokenet kunne ikke godkendes. Kopiér kommandoen igen fra din tunnel."
+    fi
+    TEMP_TOKEN="$(mktemp /etc/nexushost/.tunnel-token.XXXXXX)"
+    trap 'rm -f -- "${TEMP_TOKEN:-}"' EXIT
+    printf '%s' "$TOKEN" > "$TEMP_TOKEN"
+    chown root:nexushost-tunnel "$TEMP_TOKEN"
+    chmod 0640 "$TEMP_TOKEN"
+    mv -f -- "$TEMP_TOKEN" "$TOKEN_FILE"
+    trap - EXIT
+    unset TOKEN
+    systemctl daemon-reload
+    systemctl restart "$SERVICE"
+    sleep 2
+    if ! systemctl is-active --quiet "$SERVICE"; then
+      journalctl -u "$SERVICE" --no-pager -n 12 >&2 || true
+      fail "Tunnelen kunne ikke starte. Kontrollér tokenet og prøv igen."
+    fi
+    install -o nexushost-panel -g nexushost-panel -m 0640 /dev/null "$MARKER_FILE"
+    ;;
+  restart)
+    [[ $# -eq 1 ]] || fail "Ugyldige argumenter"
+    [[ -s "$TOKEN_FILE" ]] || fail "Tunnelen er ikke forbundet endnu"
+    systemctl restart "$SERVICE"
+    install -o nexushost-panel -g nexushost-panel -m 0640 /dev/null "$MARKER_FILE"
+    ;;
+  disconnect)
+    [[ $# -eq 1 ]] || fail "Ugyldige argumenter"
+    systemctl stop "$SERVICE" >/dev/null 2>&1 || true
+    rm -f -- "$TOKEN_FILE" "$MARKER_FILE"
+    ;;
+  *)
+    fail "Tilladt handling er install, restart eller disconnect"
+    ;;
+esac
+TUNNELHELPER
+chmod 0755 /usr/local/sbin/nexushost-tunnel-control
+chown root:root /usr/local/sbin/nexushost-tunnel-control
 
 echo "[3/7] Opretter webpanelet..."
 install -o root -g root -m 0644 /dev/null "$PANEL_HOME/app.py"
@@ -263,8 +363,12 @@ SITES_FILE = DATA / "sites.json"
 CONFIG_FILE = DATA / "config.json"
 ROOT = Path("/srv/nexushost-sites")
 BACKUPS = DATA / "backups"
+TUNNEL_MARKER = DATA / "tunnel-configured"
+TUNNEL_HELPER = "/usr/local/sbin/nexushost-tunnel-control"
+TUNNEL_SERVICE = "nexushost-tunnel.service"
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,48}$")
 DOMAIN_RE = re.compile(r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+TUNNEL_TOKEN_RE = re.compile(r"^[A-Za-z0-9+/._=-]{80,4096}$")
 
 config = json.loads(CONFIG_FILE.read_text())
 app.secret_key = config["secret_key"]
@@ -287,6 +391,43 @@ def apply_config():
     result = subprocess.run(["sudo", "/usr/local/sbin/nexushost-panel-apply"], text=True, capture_output=True)
     if result.returncode:
         raise RuntimeError(result.stderr.strip() or "Nginx kunne ikke genindlæses")
+
+def tunnel_state():
+    active = subprocess.run(["systemctl", "is-active", "--quiet", TUNNEL_SERVICE]).returncode == 0
+    enabled = subprocess.run(["systemctl", "is-enabled", "--quiet", TUNNEL_SERVICE],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    try:
+        version = subprocess.run(["cloudflared", "--version"], text=True, capture_output=True,
+                                 timeout=4).stdout.strip().replace("cloudflared version ", "")
+    except (OSError, subprocess.TimeoutExpired):
+        version = "Ikke fundet"
+    return {"active": active, "enabled": enabled, "configured": TUNNEL_MARKER.exists(),
+            "version": version or "Ukendt"}
+
+def extract_tunnel_token(raw):
+    raw = (raw or "").strip()
+    if not raw or len(raw) > 10000:
+        raise ValueError("Indsæt kommandoen fra Cloudflare")
+    if TUNNEL_TOKEN_RE.fullmatch(raw):
+        return raw
+    candidates = re.findall(r"(?<![A-Za-z0-9+/._=-])[A-Za-z0-9+/._=-]{80,4096}(?![A-Za-z0-9+/._=-])", raw)
+    candidates = [candidate for candidate in candidates if TUNNEL_TOKEN_RE.fullmatch(candidate)]
+    if len(candidates) != 1:
+        raise ValueError("Kunne ikke finde tunnel-tokenet. Kopiér hele Linux-kommandoen fra Cloudflare.")
+    return candidates[0]
+
+def run_tunnel_action(action, token=None):
+    if action not in ("install", "restart", "disconnect"):
+        raise ValueError("Ugyldig tunnel-handling")
+    try:
+        result = subprocess.run(
+            ["sudo", TUNNEL_HELPER, action], input=token, text=True,
+            capture_output=True, timeout=30,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Handlingen tog for lang tid. Prøv igen.") from exc
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or "Cloudflare Tunnel kunne ikke opdateres")
 
 def current_ip():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -321,11 +462,11 @@ def protect_csrf():
 app.jinja_env.globals["csrf_token"] = csrf_token
 
 STYLE = r'''
-:root{--bg:#07111f;--panel:#101d30;--soft:#182940;--line:#253b57;--text:#eef6ff;--muted:#91a6bd;--blue:#38a5ff;--cyan:#52e5d5;--red:#ff6474;--green:#41d898;--shadow:0 24px 65px #02081299}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 15% 0,#12325a 0,transparent 34%),var(--bg);color:var(--text);font:15px Inter,ui-sans-serif,system-ui,-apple-system,sans-serif;min-height:100vh}a{color:inherit}.shell{display:grid;grid-template-columns:245px 1fr;min-height:100vh}.side{padding:27px 20px;border-right:1px solid var(--line);background:#091523dd;backdrop-filter:blur(18px)}.brand{display:flex;gap:12px;align-items:center;font-weight:800;font-size:18px;margin:0 8px 32px}.logo{width:36px;height:36px;border-radius:12px;background:linear-gradient(135deg,var(--blue),var(--cyan));box-shadow:0 0 26px #38a5ff55;display:grid;place-items:center;color:#03233a}.nav a{display:flex;text-decoration:none;padding:12px 13px;border-radius:11px;color:var(--muted);margin:4px 0}.nav a:hover,.nav a.on{background:var(--soft);color:white}.side-foot{position:fixed;bottom:24px;color:var(--muted);font-size:12px;padding:0 8px}.main{padding:32px;max-width:1500px;width:100%}.top{display:flex;justify-content:space-between;gap:20px;align-items:center;margin-bottom:26px}.top h1{font-size:29px;margin:0 0 5px}.muted{color:var(--muted)}.button,button{border:0;border-radius:10px;background:linear-gradient(135deg,var(--blue),#2479ff);color:white;padding:11px 16px;font-weight:700;cursor:pointer;text-decoration:none;display:inline-block}.button.secondary,button.secondary{background:var(--soft);border:1px solid var(--line)}button.danger,.danger{background:#3a1721;color:#ff98a3;border:1px solid #6b2735}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:22px}.stat,.card{border:1px solid var(--line);border-radius:16px;background:linear-gradient(155deg,#13233aee,#0c1829ee);box-shadow:var(--shadow)}.stat{padding:18px}.stat .big{font-size:25px;font-weight:800;margin-top:7px}.card{padding:20px;margin-bottom:18px}.sites{display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));gap:16px}.site{padding:19px;border:1px solid var(--line);border-radius:15px;background:#101e31}.row{display:flex;align-items:center;justify-content:space-between;gap:12px}.site h3{margin:0 0 4px;font-size:18px}.pill{padding:5px 9px;border-radius:99px;font-size:12px;font-weight:800}.pill.on{background:#123d32;color:#67e8b4}.pill.off{background:#3b2530;color:#ff9aa7}.pill.lan{background:#193451;color:#72beff}.domain{font-family:ui-monospace,monospace;color:#bcd0e6;background:#0a1423;padding:8px 10px;border-radius:9px;margin:12px 0;word-break:break-all}.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:15px}.actions button,.actions .button{font-size:13px;padding:8px 11px}label{font-weight:700;display:block;margin:13px 0 7px}input,textarea,select{width:100%;border:1px solid var(--line);border-radius:10px;background:#091523;color:white;padding:12px;outline:none}input:focus,textarea:focus,select:focus{border-color:var(--blue);box-shadow:0 0 0 3px #38a5ff22}textarea{min-height:350px;font-family:ui-monospace,monospace;line-height:1.5}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.help{color:var(--muted);font-size:13px;margin-top:6px}.flash{padding:12px 14px;border-radius:11px;margin-bottom:15px;background:#143b31;border:1px solid #23684f}.flash.error{background:#3a1721;border-color:#6b2735}.empty{text-align:center;padding:55px 20px;color:var(--muted)}.login-wrap{min-height:100vh;display:grid;place-items:center;padding:20px}.login{width:min(420px,100%);padding:30px}.login h1{margin:0 0 8px}@media(max-width:900px){.shell{grid-template-columns:1fr}.side{display:none}.main{padding:20px}.grid{grid-template-columns:1fr 1fr}.form-grid{grid-template-columns:1fr}}@media(max-width:520px){.grid{grid-template-columns:1fr}.top{align-items:flex-start;flex-direction:column}}
+:root{--bg:#07111f;--panel:#101d30;--soft:#182940;--line:#253b57;--text:#eef6ff;--muted:#91a6bd;--blue:#38a5ff;--cyan:#52e5d5;--red:#ff6474;--green:#41d898;--shadow:0 24px 65px #02081299}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 15% 0,#12325a 0,transparent 34%),var(--bg);color:var(--text);font:15px Inter,ui-sans-serif,system-ui,-apple-system,sans-serif;min-height:100vh}a{color:inherit}.shell{display:grid;grid-template-columns:245px 1fr;min-height:100vh}.side{padding:27px 20px;border-right:1px solid var(--line);background:#091523dd;backdrop-filter:blur(18px)}.brand{display:flex;gap:12px;align-items:center;font-weight:800;font-size:18px;margin:0 8px 32px}.logo{width:36px;height:36px;border-radius:12px;background:linear-gradient(135deg,var(--blue),var(--cyan));box-shadow:0 0 26px #38a5ff55;display:grid;place-items:center;color:#03233a}.nav a{display:flex;text-decoration:none;padding:12px 13px;border-radius:11px;color:var(--muted);margin:4px 0}.nav a:hover,.nav a.on{background:var(--soft);color:white}.side-foot{position:fixed;bottom:24px;color:var(--muted);font-size:12px;padding:0 8px}.main{padding:32px;max-width:1500px;width:100%}.top{display:flex;justify-content:space-between;gap:20px;align-items:center;margin-bottom:26px}.top h1{font-size:29px;margin:0 0 5px}.muted{color:var(--muted)}.button,button{border:0;border-radius:10px;background:linear-gradient(135deg,var(--blue),#2479ff);color:white;padding:11px 16px;font-weight:700;cursor:pointer;text-decoration:none;display:inline-block}.button.secondary,button.secondary{background:var(--soft);border:1px solid var(--line)}button.danger,.danger{background:#3a1721;color:#ff98a3;border:1px solid #6b2735}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:22px}.stat,.card{border:1px solid var(--line);border-radius:16px;background:linear-gradient(155deg,#13233aee,#0c1829ee);box-shadow:var(--shadow)}.stat{padding:18px}.stat .big{font-size:25px;font-weight:800;margin-top:7px}.card{padding:20px;margin-bottom:18px}.sites{display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));gap:16px}.site{padding:19px;border:1px solid var(--line);border-radius:15px;background:#101e31}.row{display:flex;align-items:center;justify-content:space-between;gap:12px}.site h3{margin:0 0 4px;font-size:18px}.pill{padding:5px 9px;border-radius:99px;font-size:12px;font-weight:800}.pill.on{background:#123d32;color:#67e8b4}.pill.off{background:#3b2530;color:#ff9aa7}.pill.lan{background:#193451;color:#72beff}.pill.tunnel{background:#253257;color:#9cc8ff}.pill.direct{background:#49351b;color:#ffd38a}.domain{font-family:ui-monospace,monospace;color:#bcd0e6;background:#0a1423;padding:8px 10px;border-radius:9px;margin:12px 0;word-break:break-all}.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:15px}.actions button,.actions .button{font-size:13px;padding:8px 11px}label{font-weight:700;display:block;margin:13px 0 7px}input,textarea,select{width:100%;border:1px solid var(--line);border-radius:10px;background:#091523;color:white;padding:12px;outline:none}input:focus,textarea:focus,select:focus{border-color:var(--blue);box-shadow:0 0 0 3px #38a5ff22}textarea{min-height:350px;font-family:ui-monospace,monospace;line-height:1.5}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.help{color:var(--muted);font-size:13px;margin-top:6px}.flash{padding:12px 14px;border-radius:11px;margin-bottom:15px;background:#143b31;border:1px solid #23684f}.flash.error{background:#3a1721;border-color:#6b2735}.notice{padding:14px;border:1px solid #375b7f;border-radius:12px;background:#102943;margin:15px 0}.notice.warn{border-color:#715329;background:#332817}.steps{counter-reset:step;display:grid;gap:12px}.step{position:relative;padding:14px 14px 14px 50px;border:1px solid var(--line);border-radius:12px;background:#0b1829}.step:before{counter-increment:step;content:counter(step);position:absolute;left:14px;top:13px;width:25px;height:25px;border-radius:50%;display:grid;place-items:center;background:linear-gradient(135deg,var(--blue),#2479ff);font-weight:800}.code{font-family:ui-monospace,monospace;color:#d9eaff;background:#07111f;padding:10px;border:1px solid var(--line);border-radius:9px;word-break:break-all}.statusline{display:flex;align-items:center;gap:10px}.dot{width:11px;height:11px;border-radius:50%;background:var(--red);box-shadow:0 0 15px #ff647477}.dot.ok{background:var(--green);box-shadow:0 0 15px #41d89877}.empty{text-align:center;padding:55px 20px;color:var(--muted)}.login-wrap{min-height:100vh;display:grid;place-items:center;padding:20px}.login{width:min(420px,100%);padding:30px}.login h1{margin:0 0 8px}@media(max-width:900px){.shell{grid-template-columns:1fr}.side{display:none}.main{padding:20px}.grid{grid-template-columns:1fr 1fr}.form-grid{grid-template-columns:1fr}}@media(max-width:520px){.grid{grid-template-columns:1fr}.top{align-items:flex-start;flex-direction:column}}
 '''
 
 BASE = r'''<!doctype html><html lang="da"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{{ title }} · NexusHost</title><style>''' + STYLE + r'''</style></head><body>
-{% if session.get('logged_in') %}<div class="shell"><aside class="side"><div class="brand"><span class="logo">N</span> NexusHost Panel</div><nav class="nav"><a class="on" href="{{ url_for('dashboard') }}">● Websites</a><a href="{{ url_for('new_site') }}">＋ Tilføj website</a><a href="{{ url_for('system') }}">◫ Serverinfo</a><a href="{{ url_for('logout') }}">↪ Log ud</a></nav><div class="side-foot">Nginx · Ubuntu · gratis</div></aside><main class="main">{% else %}<div class="login-wrap"><main class="card login">{% endif %}
+{% if session.get('logged_in') %}<div class="shell"><aside class="side"><div class="brand"><span class="logo">N</span> NexusHost Panel</div><nav class="nav"><a class="{{ 'on' if request.endpoint=='dashboard' }}" href="{{ url_for('dashboard') }}">● Websites</a><a class="{{ 'on' if request.endpoint=='new_site' }}" href="{{ url_for('new_site') }}">＋ Tilføj website</a><a class="{{ 'on' if request.endpoint=='cloudflare' }}" href="{{ url_for('cloudflare') }}">◈ Cloudflare Tunnel</a><a class="{{ 'on' if request.endpoint=='system' }}" href="{{ url_for('system') }}">◫ Serverinfo</a><a href="{{ url_for('logout') }}">↪ Log ud</a></nav><div class="side-foot">Nginx · Cloudflare · Ubuntu</div></aside><main class="main">{% else %}<div class="login-wrap"><main class="card login">{% endif %}
 {% with messages=get_flashed_messages(with_categories=true) %}{% for category,message in messages %}<div class="flash {{ category }}">{{ message }}</div>{% endfor %}{% endwith %}
 {{ body|safe }}
 {% if session.get('logged_in') %}</main></div>{% else %}</main></div>{% endif %}</body></html>'''
@@ -358,11 +499,54 @@ def logout():
 @logged_in
 def dashboard():
     sites = load_sites(); ip = current_ip()
-    used = shutil.disk_usage(ROOT)
+    state = tunnel_state()
+    for site in sites:
+        scope = site.get("scope", "lan")
+        site["scope_label"] = {"lan":"Kun netværk", "tunnel":"Cloudflare", "public":"Direkte offentlig"}.get(scope, "Ukendt")
+        site["scope_class"] = {"lan":"lan", "tunnel":"tunnel", "public":"direct"}.get(scope, "off")
+        if site.get("domains"):
+            scheme = "https" if scope == "tunnel" else "http"
+            site["open_url"] = f"{scheme}://{site['domains'][0]}"
+        else:
+            site["open_url"] = f"http://{ip}:{site['port']}"
+    tunnel_sites = [site for site in sites if site.get("scope") == "tunnel" and site.get("active", True)]
     body = '''<div class="top"><div><h1>Dine websites</h1><div class="muted">Administrér alt fra ét sted</div></div><a class="button" href="{{ url_for('new_site') }}">＋ Nyt website</a></div>
-    <div class="grid"><div class="stat"><span class="muted">Websites</span><div class="big">{{ sites|length }}</div></div><div class="stat"><span class="muted">Online</span><div class="big">{{ sites|selectattr('active')|list|length }}</div></div><div class="stat"><span class="muted">Server-IP</span><div class="big" style="font-size:18px">{{ ip }}</div></div><div class="stat"><span class="muted">Ledig disk</span><div class="big">{{ free }} GB</div></div></div>
-    <div class="sites">{% for s in sites %}<article class="site"><div class="row"><div><h3>{{ s.name }}</h3><span class="muted">Port {{ s.port }}</span></div><span class="pill {{ 'on' if s.active else 'off' }}">{{ 'ONLINE' if s.active else 'STOPPET' }}</span></div><div class="domain">{% if s.domains %}{{ s.domains|join(', ') }}{% else %}{{ ip }}:{{ s.port }}{% endif %}</div><div class="row"><span class="pill {{ 'lan' if s.scope == 'lan' else 'on' }}">{{ 'Kun netværk' if s.scope == 'lan' else 'Offentlig' }}</span><span class="muted">{{ s.updated[:10] }}</span></div><div class="actions"><a class="button secondary" href="{{ url_for('edit_site', slug=s.slug) }}">Redigér</a><a class="button secondary" href="http://{% if s.domains %}{{ s.domains[0] }}{% else %}{{ ip }}:{{ s.port }}{% endif %}" target="_blank">Åbn</a><form method="post" action="{{ url_for('toggle_site', slug=s.slug) }}"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><button class="secondary">{{ 'Stop' if s.active else 'Start' }}</button></form><form method="post" action="{{ url_for('delete_site', slug=s.slug) }}" onsubmit="return confirm('Flyt websitet til backup og fjern det?')"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><button class="danger">Slet</button></form></div></article>{% else %}<div class="card empty"><h2>Ingen websites endnu</h2><p>Opret dit første website på under ét minut.</p><a class="button" href="{{ url_for('new_site') }}">Opret website</a></div>{% endfor %}</div>'''
-    return page("Websites", body, sites=sites, ip=ip, free=round(used.free/1024**3, 1))
+    <div class="grid"><div class="stat"><span class="muted">Websites</span><div class="big">{{ sites|length }}</div></div><div class="stat"><span class="muted">Online</span><div class="big">{{ sites|selectattr('active')|list|length }}</div></div><div class="stat"><span class="muted">Server-IP</span><div class="big" style="font-size:18px">{{ ip }}</div></div><div class="stat"><span class="muted">Sikker tunnel</span><div class="big" style="font-size:18px">{{ 'Forbundet' if state.active else 'Ikke forbundet' }}</div></div></div>
+    {% if tunnel_sites and not state.active %}<div class="notice warn"><b>Cloudflare Tunnel er ikke forbundet.</b> Dine Cloudflare-websites virker kun lokalt endnu. <a href="{{ url_for('cloudflare') }}">Forbind tunnelen →</a></div>{% endif %}
+    <div class="sites">{% for s in sites %}<article class="site"><div class="row"><div><h3>{{ s.name }}</h3><span class="muted">Port {{ s.port }}</span></div><span class="pill {{ 'on' if s.active else 'off' }}">{{ 'ONLINE' if s.active else 'STOPPET' }}</span></div><div class="domain">{% if s.domains %}{{ s.domains|join(', ') }}{% else %}{{ ip }}:{{ s.port }}{% endif %}</div><div class="row"><span class="pill {{ s.scope_class }}">{{ s.scope_label }}</span><span class="muted">{{ s.updated[:10] }}</span></div><div class="actions"><a class="button secondary" href="{{ url_for('edit_site', slug=s.slug) }}">Redigér</a><a class="button secondary" href="{{ s.open_url }}" target="_blank" rel="noopener">Åbn</a><form method="post" action="{{ url_for('toggle_site', slug=s.slug) }}"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><button class="secondary">{{ 'Stop' if s.active else 'Start' }}</button></form><form method="post" action="{{ url_for('delete_site', slug=s.slug) }}" onsubmit="return confirm('Flyt websitet til backup og fjern det?')"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><button class="danger">Slet</button></form></div></article>{% else %}<div class="card empty"><h2>Ingen websites endnu</h2><p>Opret dit første website på under ét minut.</p><a class="button" href="{{ url_for('new_site') }}">Opret website</a></div>{% endfor %}</div>'''
+    return page("Websites", body, sites=sites, ip=ip, state=state, tunnel_sites=tunnel_sites)
+
+@app.route("/cloudflare", methods=["GET", "POST"])
+@logged_in
+def cloudflare():
+    if request.method == "POST":
+        action = request.form.get("action", "")
+        try:
+            if action == "connect":
+                token = extract_tunnel_token(request.form.get("token", ""))
+                run_tunnel_action("install", token)
+                del token
+                flash("Cloudflare Tunnel er forbundet og starter automatisk med Ubuntu.")
+            elif action == "restart":
+                run_tunnel_action("restart")
+                flash("Cloudflare Tunnel er genstartet.")
+            elif action == "disconnect":
+                run_tunnel_action("disconnect")
+                flash("Cloudflare Tunnel er afbrudt. Ingen website-filer er slettet.")
+            else:
+                raise ValueError("Ugyldig handling")
+        except (ValueError, RuntimeError, OSError) as exc:
+            flash(str(exc), "error")
+        return redirect(url_for("cloudflare"))
+
+    state = tunnel_state()
+    tunnel_sites = [site for site in load_sites() if site.get("scope") == "tunnel"]
+    body = '''<div class="top"><div><h1>Cloudflare Tunnel</h1><div class="muted">Offentlige hjemmesider uden åbne routerporte</div></div><a class="button secondary" href="https://one.dash.cloudflare.com/" target="_blank" rel="noopener">Åbn Cloudflare ↗</a></div>
+    <section class="card"><div class="row"><div><h2 style="margin:0 0 7px">Forbindelse</h2><div class="statusline"><span class="dot {{ 'ok' if state.active }}"></span><b>{{ 'Forbundet' if state.active else ('Stoppet' if state.configured else 'Ikke opsat') }}</b></div></div><span class="muted">cloudflared {{ state.version }}</span></div>{% if state.configured %}<div class="actions"><form method="post"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><input type="hidden" name="action" value="restart"><button class="secondary">Genstart tunnel</button></form><form method="post" onsubmit="return confirm('Afbryd tunnelen? Dine offentlige domæner går offline.')"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><input type="hidden" name="action" value="disconnect"><button class="danger">Afbryd tunnel</button></form></div>{% endif %}</section>
+    <section class="card"><h2>Opsætning – kun én gang</h2><div class="notice"><b>Du skal ikke logge ind på routeren og ikke åbne nogen porte.</b> Dashboardet bliver på dit lokale netværk.</div><div class="steps"><div class="step">Køb et domæne, opret en gratis Cloudflare-konto, tilføj domænet og skift navneservere som Cloudflare viser.</div><div class="step">I Cloudflare: gå til <b>Networking → Tunnels</b>, vælg <b>Create tunnel</b>, giv den navnet <b>NexusHost</b>, og vælg Linux.</div><div class="step">Kopiér hele installationskommandoen fra Cloudflare og indsæt den herunder. NexusHost kører den ikke direkte; det finder kun det hemmelige tunnel-token.</div><div class="step">Når der står <b>Forbundet</b>, tilføjer du en <b>Published application</b> i Cloudflare for hvert domæne. Brug den Service URL, som NexusHost viser længere nede.</div></div>
+    <form method="post" style="margin-top:18px"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><input type="hidden" name="action" value="connect"><label>{{ 'Udskift tunnel-token' if state.configured else 'Cloudflare Linux-kommando' }}</label><input type="password" name="token" autocomplete="off" placeholder="sudo cloudflared service install eyJ..." required><div class="help">Tokenet gemmes i en beskyttet systemfil og vises aldrig igen.</div><button style="margin-top:14px">{{ 'Opdatér forbindelse' if state.configured else 'Forbind sikkert' }}</button></form></section>
+    <section class="card"><h2>Ruter til dine websites</h2><p class="muted">Skriv hver adresse i Cloudflares Published application. Vælg HTTP som service.</p>{% for site in tunnel_sites %}<div class="site" style="margin-top:12px"><div class="row"><b>{{ site.name }}</b><span class="pill {{ 'on' if site.active else 'off' }}">{{ 'KLAR' if site.active else 'STOPPET' }}</span></div>{% if site.domains %}{% for domain in site.domains %}<p><b>Hostname:</b> {{ domain }}</p>{% endfor %}{% else %}<p class="muted">Tilføj først et domæne under Redigér website.</p>{% endif %}<div class="code">Service URL: http://localhost:{{ site.port }}</div></div>{% else %}<div class="empty"><p>Du har endnu ingen websites med adgangstypen Cloudflare Tunnel.</p><a class="button" href="{{ url_for('new_site') }}">Opret Cloudflare-website</a></div>{% endfor %}<div class="notice warn"><b>Vigtigt:</b> Tilføj aldrig dashboardets adresse eller port 9090 som en Cloudflare-rute. Kun dine websites skal være offentlige.</div></section>'''
+    return page("Cloudflare Tunnel", body, state=state, tunnel_sites=tunnel_sites)
 
 def parse_domains(raw):
     domains = []
@@ -381,13 +565,13 @@ def validate_site_form(existing_slug=None):
     except ValueError: raise ValueError("Porten skal være et tal")
     if not 1024 <= port <= 65535 or port == 9090: raise ValueError("Vælg en port mellem 1024 og 65535 (ikke 9090)")
     scope = request.form.get("scope")
-    if scope not in ("lan", "public"): raise ValueError("Vælg en adgangstype")
+    if scope not in ("lan", "tunnel", "public"): raise ValueError("Vælg en adgangstype")
     domains = parse_domains(request.form.get("domains", ""))
     sites = load_sites()
     for other in sites:
         if other["slug"] == slug: continue
-        if not domains and not other["domains"] and other["port"] == port: raise ValueError("Porten bruges allerede af et website uden domæne")
-        if set(domains) & set(other["domains"]): raise ValueError("Domænet bruges allerede af et andet website")
+        if other["port"] == port: raise ValueError("Porten bruges allerede af et andet website")
+        if set(domains) & set(other.get("domains", [])): raise ValueError("Domænet bruges allerede af et andet website")
     return name, slug, port, scope, domains
 
 @app.route("/sites/new", methods=["GET", "POST"])
@@ -412,7 +596,7 @@ def new_site():
             flash("Websitet blev oprettet.")
             return redirect(url_for("edit_site", slug=slug))
         except (ValueError, RuntimeError, OSError) as exc: flash(str(exc), "error")
-    body = '''<div class="top"><div><h1>Nyt website</h1><div class="muted">Du kan ændre det hele senere</div></div></div><section class="card"><form method="post"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><div class="form-grid"><div><label>Navn</label><input name="name" maxlength="80" placeholder="Min hjemmeside" required></div><div><label>Port</label><input name="port" type="number" min="1024" max="65535" value="{{ suggested }}" required><div class="help">Fx 8081. Panel bruger 9090.</div></div></div><label>Domæner (valgfrit)</label><input name="domains" placeholder="minside.dk, www.minside.dk"><div class="help">Adskil flere domæner med komma. DNS skal pege mod din offentlige IP.</div><label>Adgang</label><select name="scope"><option value="lan">Kun mit lokale netværk (anbefalet til test)</option><option value="public">Offentlig på internettet</option></select><button style="margin-top:20px">Opret website</button> <a class="button secondary" href="{{ url_for('dashboard') }}">Annullér</a></form></section>'''
+    body = '''<div class="top"><div><h1>Nyt website</h1><div class="muted">Du kan ændre det hele senere</div></div></div><section class="card"><form method="post"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><div class="form-grid"><div><label>Navn</label><input name="name" maxlength="80" placeholder="Min hjemmeside" required></div><div><label>Port</label><input name="port" type="number" min="1024" max="65535" value="{{ suggested }}" required><div class="help">Fx 8081. Dashboardet bruger 9090.</div></div></div><label>Domæner (valgfrit)</label><input name="domains" placeholder="minside.dk, www.minside.dk"><div class="help">Adskil flere domæner med komma. Cloudflare-ruten klarer forbindelsen, så domænet skal ikke pege på din hjemme-IP.</div><label>Adgang</label><select name="scope"><option value="lan">Kun mit lokale netværk</option><option value="tunnel">Offentlig via Cloudflare Tunnel – uden routerporte</option></select><div class="notice"><b>Sikker offentlig adgang:</b> Cloudflare Tunnel kræver ingen port forwarding. Du skal have et domæne til en fast offentlig adresse.</div><button style="margin-top:6px">Opret website</button> <a class="button secondary" href="{{ url_for('dashboard') }}">Annullér</a></form></section>'''
     used = {s["port"] for s in load_sites()}; suggested = next((p for p in range(8081, 9000) if p not in used), 10080)
     return page("Nyt website", body, suggested=suggested)
 
@@ -484,7 +668,7 @@ def edit_site(slug):
         except (ValueError, RuntimeError, OSError, zipfile.BadZipFile) as exc: flash(str(exc),"error")
     try: content=index.read_text()[:1024*1024]
     except (FileNotFoundError,UnicodeDecodeError): content=""
-    body='''<div class="top"><div><h1>{{ site.name }}</h1><div class="muted">/srv/nexushost-sites/{{ site.slug }}/public</div></div><a class="button secondary" href="{{ url_for('dashboard') }}">← Tilbage</a></div><section class="card"><h2>Indstillinger</h2><form method="post"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><input type="hidden" name="action" value="settings"><div class="form-grid"><div><label>Navn</label><input name="name" value="{{ site.name }}" required></div><div><label>Port</label><input name="port" type="number" min="1024" max="65535" value="{{ site.port }}" required></div></div><label>Domæner</label><input name="domains" value="{{ site.domains|join(', ') }}"><label>Adgang</label><select name="scope"><option value="lan" {{ 'selected' if site.scope=='lan' }}>Kun lokalt netværk</option><option value="public" {{ 'selected' if site.scope=='public' }}>Offentlig på internettet</option></select><button style="margin-top:18px">Gem indstillinger</button></form></section><section class="card"><h2>Upload et færdigt website</h2><p class="muted">ZIP-filen skal indeholde en index.html. Maks. 100 MB. Din nuværende version bliver automatisk gemt som backup.</p><form method="post" enctype="multipart/form-data"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><input type="hidden" name="action" value="upload"><input type="file" name="zipfile" accept=".zip" required><button style="margin-top:14px">Upload og udgiv</button></form></section><section class="card"><h2>Redigér index.html</h2><form method="post"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><input type="hidden" name="action" value="html"><textarea name="content" spellcheck="false">{{ content }}</textarea><button style="margin-top:14px">Gem og udgiv</button></form></section>'''
+    body='''<div class="top"><div><h1>{{ site.name }}</h1><div class="muted">/srv/nexushost-sites/{{ site.slug }}/public</div></div><a class="button secondary" href="{{ url_for('dashboard') }}">← Tilbage</a></div><section class="card"><h2>Indstillinger</h2><form method="post"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><input type="hidden" name="action" value="settings"><div class="form-grid"><div><label>Navn</label><input name="name" value="{{ site.name }}" required></div><div><label>Port</label><input name="port" type="number" min="1024" max="65535" value="{{ site.port }}" required></div></div><label>Domæner</label><input name="domains" value="{{ site.domains|join(', ') }}" placeholder="minside.dk, www.minside.dk"><div class="help">Adskil flere domæner med komma.</div><label>Adgang</label><select name="scope"><option value="lan" {{ 'selected' if site.scope=='lan' }}>Kun lokalt netværk</option><option value="tunnel" {{ 'selected' if site.scope=='tunnel' }}>Offentlig via Cloudflare Tunnel – uden routerporte</option>{% if site.scope=='public' %}<option value="public" selected>Ældre direkte offentlig opsætning – skift til Tunnel</option>{% endif %}</select><button style="margin-top:18px">Gem indstillinger</button></form>{% if site.scope=='tunnel' %}<div class="notice"><b>Cloudflare Service URL:</b><div class="code" style="margin-top:9px">http://localhost:{{ site.port }}</div><p style="margin-bottom:0"><a href="{{ url_for('cloudflare') }}">Åbn tunnelopsætningen →</a></p></div>{% elif site.scope=='public' %}<div class="notice warn"><b>Advarsel:</b> Dette site bruger den ældre direkte offentlige metode. Vælg Cloudflare Tunnel ovenfor, så routerporten kan lukkes.</div>{% endif %}</section><section class="card"><h2>Upload et færdigt website</h2><p class="muted">ZIP-filen skal indeholde en index.html. Maks. 100 MB. Din nuværende version bliver automatisk gemt som backup.</p><form method="post" enctype="multipart/form-data"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><input type="hidden" name="action" value="upload"><input type="file" name="zipfile" accept=".zip" required><button style="margin-top:14px">Upload og udgiv</button></form></section><section class="card"><h2>Redigér index.html</h2><form method="post"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><input type="hidden" name="action" value="html"><textarea name="content" spellcheck="false">{{ content }}</textarea><button style="margin-top:14px">Gem og udgiv</button></form></section>'''
     return page(site["name"], body, site=site, content=content)
 
 @app.post("/sites/<slug>/toggle")
@@ -519,12 +703,12 @@ def delete_site(slug):
 @app.route("/system")
 @logged_in
 def system():
-    ip=current_ip(); sites=load_sites(); uptime="Ukendt"
+    ip=current_ip(); sites=load_sites(); uptime="Ukendt"; state=tunnel_state()
     try:
         seconds=float(Path("/proc/uptime").read_text().split()[0]); uptime=f"{int(seconds//86400)} dage, {int(seconds%86400//3600)} timer"
     except OSError: pass
-    body='''<div class="top"><div><h1>Serverinfo</h1><div class="muted">Status og næste skridt</div></div></div><div class="grid"><div class="stat"><span class="muted">Lokal IP</span><div class="big" style="font-size:18px">{{ ip }}</div></div><div class="stat"><span class="muted">Dashboard</span><div class="big">Port 80 / 9090</div></div><div class="stat"><span class="muted">Oppetid</span><div class="big" style="font-size:18px">{{ uptime }}</div></div><div class="stat"><span class="muted">Aktive sites</span><div class="big">{{ sites|selectattr('active')|list|length }}</div></div></div><section class="card"><h2>Sådan gør du et website offentligt</h2><p>1. Vælg <b>Offentlig</b> på websitet.</p><p>2. Uden domæne: port-forward websitets valgte TCP-port til <b>{{ ip }}</b>.</p><p>3. Med domæne: port-forward TCP-port 80, og lad domænets A-record pege på din offentlige IP.</p><p class="muted">Din internetudbyder kan bruge CGNAT. I så fald virker almindelig port-forwarding ikke, og du skal bruge fx Cloudflare Tunnel.</p></section><section class="card"><h2>Automatisk opstart</h2><p>Dashboardet og alle websites, der står som <b>ONLINE</b>, starter automatisk efter en nedlukning eller genstart. Du skal ikke skrive nogen kommando.</p></section><section class="card"><h2>Nyttige kommandoer</h2><div class="domain">sudo systemctl status nexushost-webpanel<br>sudo journalctl -u nexushost-webpanel -f<br>sudo nginx -t</div></section>'''
-    return page("Serverinfo",body,ip=ip,uptime=uptime,sites=sites)
+    body='''<div class="top"><div><h1>Serverinfo</h1><div class="muted">Status og næste skridt</div></div></div><div class="grid"><div class="stat"><span class="muted">Lokal IP</span><div class="big" style="font-size:18px">{{ ip }}</div></div><div class="stat"><span class="muted">Dashboard</span><div class="big">Port 80 / 9090</div></div><div class="stat"><span class="muted">Oppetid</span><div class="big" style="font-size:18px">{{ uptime }}</div></div><div class="stat"><span class="muted">Tunnel</span><div class="big" style="font-size:18px">{{ 'Forbundet' if state.active else 'Ikke forbundet' }}</div></div></div><section class="card"><h2>Sikker offentlig adgang</h2><p>Vælg <b>Cloudflare Tunnel</b> på et website. Så forbinder serveren ud til Cloudflare, og du skal ikke åbne porte eller ændre noget i routeren.</p><p><a class="button" href="{{ url_for('cloudflare') }}">Opsæt Cloudflare Tunnel</a></p><p class="muted">Muligheden Direkte offentlig findes kun til avancerede brugere og anbefales ikke på et hjemmenetværk.</p></section><section class="card"><h2>Automatisk opstart</h2><p>Dashboardet, alle aktive hjemmesider og en forbundet Cloudflare Tunnel starter automatisk efter en nedlukning eller genstart. Du skal ikke skrive nogen kommando.</p></section><section class="card"><h2>Nyttige kommandoer</h2><div class="domain">sudo systemctl status nexushost-webpanel<br>sudo systemctl status nexushost-tunnel<br>sudo journalctl -u nexushost-webpanel -f<br>sudo nginx -t</div></section>'''
+    return page("Serverinfo",body,ip=ip,uptime=uptime,sites=sites,state=state)
 
 @app.get("/health")
 def health(): return {"ok":True}
@@ -537,6 +721,29 @@ import json,sys
 with open(sys.argv[1],"w") as f: json.dump({"username":sys.argv[2],"password_hash":sys.argv[3],"secret_key":sys.argv[4]},f)
 PYCONFIG
 [[ -f "$DATA_DIR/sites.json" ]] || printf '[]\n' > "$DATA_DIR/sites.json"
+python3 - "$DATA_DIR/sites.json" <<'PYSCOPES'
+import json, os, sys
+
+path = sys.argv[1]
+try:
+    with open(path, encoding="utf-8") as handle:
+        sites = json.load(handle)
+except (OSError, json.JSONDecodeError):
+    sites = []
+
+changed = False
+if isinstance(sites, list):
+    for site in sites:
+        if isinstance(site, dict) and site.get("scope") == "public":
+            site["scope"] = "tunnel"
+            changed = True
+if changed:
+    temporary = path + ".scope-update"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump(sites, handle, ensure_ascii=False, indent=2)
+    os.replace(temporary, path)
+    print("Eksisterende offentlige websites er flyttet til sikker Cloudflare Tunnel-adgang.")
+PYSCOPES
 chown "$PANEL_USER:$PANEL_USER" "$DATA_DIR/config.json" "$DATA_DIR/sites.json"
 chmod 0600 "$DATA_DIR/config.json" "$DATA_DIR/sites.json"
 chown root:root "$PANEL_HOME/app.py"
@@ -564,6 +771,9 @@ server {
     allow ::1;
     allow fc00::/7;
     deny all;
+    if (\$host !~* "^(localhost|127\\.0\\.0\\.1|10\\.[0-9.]+|192\\.168\\.[0-9.]+|172\\.(1[6-9]|2[0-9]|3[01])\\.[0-9.]+)$") {
+        return 404;
+    }
     client_max_body_size 100m;
     location / {
         proxy_pass http://127.0.0.1:9080;
@@ -595,27 +805,75 @@ Restart=always
 RestartSec=3
 PrivateTmp=true
 ProtectSystem=full
-ReadWritePaths=${DATA_DIR} ${SITE_ROOT} /etc/nginx/nexushost-sites -/etc/ufw -/var/lib/ufw
+ReadWritePaths=${DATA_DIR} ${SITE_ROOT} ${TUNNEL_DIR} /etc/nginx/nexushost-sites -/etc/ufw -/var/lib/ufw
 ProtectHome=true
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
+cat > /etc/systemd/system/nexushost-tunnel.service <<EOF
+[Unit]
+Description=NexusHost Cloudflare Tunnel
+Documentation=https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=${TUNNEL_DIR}/tunnel-token
+
+[Service]
+Type=simple
+User=${TUNNEL_USER}
+Group=${TUNNEL_USER}
+ExecStart=${CLOUDFLARED_BIN} --no-autoupdate tunnel run --token-file ${TUNNEL_DIR}/tunnel-token
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
 cat > /etc/sudoers.d/nexushost-webpanel <<EOF
-${PANEL_USER} ALL=(root) NOPASSWD: /usr/local/sbin/nexushost-panel-apply
+${PANEL_USER} ALL=(root) NOPASSWD: /usr/local/sbin/nexushost-panel-apply, /usr/local/sbin/nexushost-tunnel-control install, /usr/local/sbin/nexushost-tunnel-control restart, /usr/local/sbin/nexushost-tunnel-control disconnect
 EOF
 chmod 0440 /etc/sudoers.d/nexushost-webpanel
 
 echo "[6/7] Tester opsætningen..."
 /usr/sbin/visudo -cf /etc/sudoers.d/nexushost-webpanel
 python3 -m py_compile "$PANEL_HOME/app.py" /usr/local/sbin/nexushost-panel-apply
+bash -n /usr/local/sbin/nexushost-tunnel-control
 python3 -c 'import flask, gunicorn, werkzeug'
+CLOUDFLARED_HELP="$("$CLOUDFLARED_BIN" tunnel run --help 2>&1)"
+if [[ "$CLOUDFLARED_HELP" != *"--token-file"* ]]; then
+  echo "FEJL: Den installerede cloudflared-version er for gammel til sikker token-lagring."
+  exit 1
+fi
+unset CLOUDFLARED_HELP
 /usr/sbin/nginx -t
 systemctl daemon-reload
-systemctl enable nginx nexushost-webpanel
+systemctl enable nginx nexushost-webpanel nexushost-tunnel
 systemctl restart nginx
 systemctl restart nexushost-webpanel
+if [[ -s "$TUNNEL_DIR/tunnel-token" ]]; then
+  chown root:"$TUNNEL_USER" "$TUNNEL_DIR/tunnel-token"
+  chmod 0640 "$TUNNEL_DIR/tunnel-token"
+  install -o "$PANEL_USER" -g "$PANEL_USER" -m 0640 /dev/null "$DATA_DIR/tunnel-configured"
+  systemctl restart nexushost-tunnel || true
+fi
 
 # If UFW is already active, allow the panel from private IPv4 networks without changing SSH rules.
 if command -v ufw >/dev/null 2>&1 && ufw status | grep -q '^Status: active'; then
@@ -647,22 +905,6 @@ systemctl is-enabled --quiet nexushost-webpanel
 systemctl is-active --quiet nginx
 systemctl is-active --quiet nexushost-webpanel
 
-# Den nye udgave virker; fjern nu resterne af den tidligere udgave.
-rm -f -- \
-  "/etc/systemd/system/${LEGACY_SERVICE}.service" \
-  "/etc/sudoers.d/${LEGACY_SERVICE}" \
-  "/usr/local/sbin/${LEGACY_TAG}-panel-apply" \
-  "/etc/nginx/sites-available/${LEGACY_TAG}-panel"
-if [[ "$LEGACY_HOME" == "/opt/${LEGACY_TAG}-webpanel" && \
-      "$LEGACY_DATA" == "/var/lib/${LEGACY_TAG}-webpanel" && \
-      "$LEGACY_SITE_ROOT" == "/srv/${LEGACY_TAG}-sites" ]]; then
-  rm -rf -- "$LEGACY_HOME" "$LEGACY_DATA" "$LEGACY_SITE_ROOT" "/etc/nginx/${LEGACY_TAG}-sites"
-fi
-if id "$LEGACY_USER" >/dev/null 2>&1; then
-  userdel "$LEGACY_USER" >/dev/null 2>&1 || true
-fi
-systemctl daemon-reload
-
 echo "[7/7] Færdig!"
 
 cat <<DONE
@@ -681,6 +923,8 @@ GEM ADGANGSKODEN NU. Den vises kun under installationen.
 Åbn dashboardet fra en computer eller mobil på samme netværk.
 Du skal ikke køre flere kommandoer efter en genstart.
 Dashboardet og alle aktive hjemmesider starter automatisk med Ubuntu.
+Cloudflare Tunnel kan forbindes fra menupunktet "Cloudflare Tunnel".
+Du skal ikke åbne porte eller ændre noget i routeren.
 
 Status: sudo systemctl status nexushost-webpanel
 Logs:   sudo journalctl -u nexushost-webpanel -f
