@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# NexusHost Webpanel v2.1 - one-file installer for Ubuntu 22.04/24.04/26.04.
+# NexusHost Webpanel v2.2 - one-file installer for Ubuntu 22.04/24.04/26.04.
 # Run with: sudo bash installer-nexushost.sh
 
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
@@ -51,6 +51,18 @@ apt-get install -y nginx python3 python3-flask python3-gunicorn unzip openssl cu
 if [[ -z "$ADMIN_PASSWORD" ]]; then
   ADMIN_PASSWORD="$(openssl rand -base64 24 | tr -d '\n' | tr '/+' 'xy')"
 fi
+
+# Ubuntu-versioner bruger enten navnet gunicorn eller gunicorn3.
+GUNICORN_START="$(command -v gunicorn 2>/dev/null || command -v gunicorn3 2>/dev/null || true)"
+if [[ -z "$GUNICORN_START" ]]; then
+  if python3 -c 'import gunicorn' >/dev/null 2>&1; then
+    GUNICORN_START="/usr/bin/python3 -m gunicorn"
+  else
+    echo "FEJL: Gunicorn blev installeret, men programmet kunne ikke findes."
+    exit 1
+  fi
+fi
+echo "Gunicorn fundet: $GUNICORN_START"
 
 if ! id "$PANEL_USER" >/dev/null 2>&1; then
   useradd --system --home "$PANEL_HOME" --shell /usr/sbin/nologin "$PANEL_USER"
@@ -578,7 +590,7 @@ User=${PANEL_USER}
 Group=${PANEL_USER}
 WorkingDirectory=${PANEL_HOME}
 ExecStartPre=/usr/bin/sudo /usr/local/sbin/nexushost-panel-apply
-ExecStart=/usr/bin/gunicorn --workers 2 --threads 4 --bind 127.0.0.1:9080 --access-logfile - app:app
+ExecStart=${GUNICORN_START} --workers 2 --threads 4 --bind 127.0.0.1:9080 --access-logfile - app:app
 Restart=always
 RestartSec=3
 PrivateTmp=true
@@ -598,6 +610,7 @@ chmod 0440 /etc/sudoers.d/nexushost-webpanel
 echo "[6/7] Tester opsætningen..."
 /usr/sbin/visudo -cf /etc/sudoers.d/nexushost-webpanel
 python3 -m py_compile "$PANEL_HOME/app.py" /usr/local/sbin/nexushost-panel-apply
+python3 -c 'import flask, gunicorn, werkzeug'
 /usr/sbin/nginx -t
 systemctl daemon-reload
 systemctl enable nginx nexushost-webpanel
