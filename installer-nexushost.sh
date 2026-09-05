@@ -1004,7 +1004,7 @@ Restart=always
 RestartSec=3
 PrivateTmp=true
 ProtectSystem=full
-ReadWritePaths=${DATA_DIR} ${SITE_ROOT} ${TUNNEL_DIR} /etc/nginx/nexushost-sites -/etc/ufw -/var/lib/ufw
+ReadWritePaths=${DATA_DIR} ${SITE_ROOT} ${TUNNEL_DIR} /etc/nginx/nexushost-sites /etc/systemd/system -/etc/ufw -/var/lib/ufw
 ProtectHome=true
 
 [Install]
