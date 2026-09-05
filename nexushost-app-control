@@ -44,7 +44,7 @@ case "${ACTION}" in
     STAGE="${SITE_DIR}/.github-$(date +%s)-$$"
     trap 'rm -rf -- "${STAGE:-}"' EXIT
 
-    if ! runuser -u "${PANEL_USER}" -- git clone --depth 1 --no-tags --single-branch "${URL}" "${STAGE}" >/dev/null 2>&1; then
+    if ! runuser -u "${PANEL_USER}" -- env HOME=/tmp git clone --depth 1 --no-tags --single-branch "${URL}" "${STAGE}" >/dev/null 2>&1; then
       fail "GitHub-repository kunne ikke hentes. Kontrollér at linket er offentligt og korrekt."
     fi
     rm -rf -- "${STAGE}/.git"
@@ -78,10 +78,17 @@ PY
       trap - EXIT
       chown -R "${PANEL_USER}:${PANEL_USER}" "${APP_DIR}"
 
-      if ! runuser -u "${PANEL_USER}" -- bash -lc "cd '${APP_DIR}' && npm install --omit=dev --ignore-scripts --no-audit --no-fund" >/dev/null 2>&1; then
+      NPM_CACHE="${SITE_DIR}/.npm-cache"
+      install -d -o "${PANEL_USER}" -g "${PANEL_USER}" -m 0750 "${NPM_CACHE}"
+      NPM_LOG="${SITE_DIR}/.npm-install.log"
+      if ! runuser -u "${PANEL_USER}" -- env HOME=/tmp npm_config_cache="${NPM_CACHE}" \
+        bash -lc "cd '${APP_DIR}' && npm install --omit=dev --no-audit --no-fund" >"${NPM_LOG}" 2>&1; then
+        echo "npm install fejlede. Seneste npm-output:" >&2
+        tail -n 30 "${NPM_LOG}" >&2 || true
         rm -rf -- "${APP_DIR}"
-        fail "npm install fejlede. Repository kunne ikke deployes."
+        fail "Repository kunne ikke deployes på grund af npm-fejlen ovenfor."
       fi
+      rm -f -- "${NPM_LOG}"
 
       NPM_BIN="$(command -v npm)"
       cat > "${UNIT}" <<EOF
@@ -98,6 +105,7 @@ Environment=NODE_ENV=production
 Environment=HOST=127.0.0.1
 Environment=PORT=${APP_PORT}
 Environment=HOME=/tmp
+EnvironmentFile=-${SITE_DIR}/app.env
 ExecStart=${NPM_BIN} start
 Restart=on-failure
 RestartSec=3
