@@ -1,0 +1,38 @@
+name: NexusHost CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Bash syntax
+        run: |
+          bash -n installer-nexushost.sh
+          bash -n nexushost-app-control
+
+      - name: Extract embedded Python
+        run: |
+          awk '/^cat > \/usr\/local\/sbin\/nexushost-panel-apply <<.PYHELPER./{take=1;next} /^PYHELPER$/{take=0} take' installer-nexushost.sh > /tmp/panel_apply.py
+          awk '/^cat > "\$PANEL_HOME\/app.py" <<.PYAPP./{take=1;next} /^PYAPP$/{take=0} take' installer-nexushost.sh > /tmp/app.py
+          test -s /tmp/panel_apply.py
+          test -s /tmp/app.py
+          python3 -m py_compile /tmp/panel_apply.py /tmp/app.py
+
+      - name: Verify GitHub deploy hooks
+        run: |
+          grep -q 'action == "github"' installer-nexushost.sh
+          grep -q 'nexushost-app-control' installer-nexushost.sh
+          grep -q 'proxy_pass http://127.0.0.1:' installer-nexushost.sh
+          grep -q 'npm install --omit=dev' nexushost-app-control
