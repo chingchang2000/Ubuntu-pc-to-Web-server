@@ -443,7 +443,7 @@ TUNNEL_HELPER = "/usr/local/sbin/nexushost-tunnel-control"
 TUNNEL_SERVICE = "nexushost-tunnel.service"
 APP_HELPER = "/usr/local/sbin/nexushost-app-control"
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,48}$")
-GITHUB_RE = re.compile(r"^https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\\.git)?$")
+GITHUB_RE = re.compile(r"^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?$")
 DOMAIN_RE = re.compile(r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 TUNNEL_TOKEN_RE = re.compile(r"^[A-Za-z0-9+/._=-]{80,4096}$")
 
