@@ -183,11 +183,16 @@ EOF
     systemctl enable --now "${SERVICE}"
     ;;
 
+  restart)
+    [[ -f "${UNIT}" ]] || fail "Node-servicen findes ikke"
+    systemctl restart "${SERVICE}"
+    ;;
+
   stop)
     systemctl disable --now "${SERVICE}" >/dev/null 2>&1 || true
     ;;
 
   *)
-    fail "Tilladt handling er deploy, remove, delete, start eller stop"
+    fail "Tilladt handling er deploy, remove, delete, start, restart eller stop"
     ;;
 esac
