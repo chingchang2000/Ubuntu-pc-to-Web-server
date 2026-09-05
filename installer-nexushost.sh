@@ -49,7 +49,19 @@ fi
 
 echo "[1/7] Installerer Nginx, Python og nødvendige pakker..."
 apt-get update
-apt-get install -y nginx python3 python3-flask python3-gunicorn unzip openssl curl ca-certificates sudo
+apt-get install -y nginx python3 python3-flask python3-gunicorn unzip openssl curl ca-certificates sudo git nodejs npm
+
+NODE_MAJOR="$(node -p "Number(process.versions.node.split('.')[0])" 2>/dev/null || echo 0)"
+if (( NODE_MAJOR < 20 )); then
+  echo "Installerer Node.js 22 LTS til GitHub/Node-apps..."
+  curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+  apt-get install -y nodejs
+fi
+NODE_MAJOR="$(node -p "Number(process.versions.node.split('.')[0])" 2>/dev/null || echo 0)"
+if (( NODE_MAJOR < 20 )); then
+  echo "FEJL: NexusHost kræver Node.js 20+ for at kunne deploye Node-apps fra GitHub."
+  exit 1
+fi
 if [[ -z "$ADMIN_PASSWORD" ]]; then
   ADMIN_PASSWORD="$(openssl rand -base64 24 | tr -d '\n' | tr '/+' 'xy')"
 fi
@@ -160,6 +172,23 @@ install -o root -g root -m 0644 "$LOGO_TEMP" "$PANEL_HOME/static/nexushost-logo.
 rm -f -- "$LOGO_TEMP"
 unset LOGO_SHA256 INSTALLER_DIR LOGO_LOCAL LOGO_TEMP
 
+APP_HELPER="/usr/local/sbin/nexushost-app-control"
+APP_HELPER_LOCAL="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P || true)/nexushost-app-control"
+if [[ -f "$APP_HELPER_LOCAL" ]]; then
+  install -o root -g root -m 0755 "$APP_HELPER_LOCAL" "$APP_HELPER"
+else
+  if ! curl --fail --silent --show-error --location --retry 3 --connect-timeout 20 \
+    "https://raw.githubusercontent.com/chingchang2000/Ubuntu-pc-to-Web-server/main/nexushost-app-control" \
+    --output "$APP_HELPER"; then
+    rm -f -- "$APP_HELPER"
+    echo "FEJL: GitHub-deploy-hjælperen kunne ikke hentes."
+    exit 1
+  fi
+  chown root:root "$APP_HELPER"
+  chmod 0755 "$APP_HELPER"
+fi
+unset APP_HELPER_LOCAL
+
 echo "[2/7] Opretter den sikre server-hjælper..."
 install -o root -g root -m 0755 /dev/null /usr/local/sbin/nexushost-panel-apply
 cat > /usr/local/sbin/nexushost-panel-apply <<'PYHELPER'
@@ -208,6 +237,29 @@ def nginx_config(site):
     allow ::1;
     allow fc00::/7;
     deny all;"""
+    runtime = site.get("runtime", "static")
+    if runtime not in ("static", "node"):
+        fail("Ugyldig website-runtime")
+    if runtime == "node":
+        app_port = site.get("app_port")
+        if not isinstance(app_port, int) or not 18000 <= app_port <= 29999:
+            fail("Ugyldig intern Node-port")
+        location = f"""    location / {{
+        proxy_pass http://127.0.0.1:{app_port};
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_connect_timeout 10s;
+        proxy_read_timeout 120s;
+    }}"""
+    else:
+        location = """    location / {
+        try_files $uri $uri/ =404;
+    }"""
     return f'''# Managed by NexusHost Webpanel - do not edit manually
 server {{
     listen {port}{default};
@@ -221,9 +273,7 @@ server {{
     server_tokens off;
     add_header X-Content-Type-Options "nosniff" always;
     add_header Referrer-Policy "strict-origin-when-cross-origin" always;{access}
-    location / {{
-        try_files $uri $uri/ =404;
-    }}
+{location}
     location ~ /\\. {{ deny all; }}
 }}
 '''
@@ -391,7 +441,9 @@ BACKUPS = DATA / "backups"
 TUNNEL_MARKER = DATA / "tunnel-configured"
 TUNNEL_HELPER = "/usr/local/sbin/nexushost-tunnel-control"
 TUNNEL_SERVICE = "nexushost-tunnel.service"
+APP_HELPER = "/usr/local/sbin/nexushost-app-control"
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,48}$")
+GITHUB_RE = re.compile(r"^https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\\.git)?$")
 DOMAIN_RE = re.compile(r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 TUNNEL_TOKEN_RE = re.compile(r"^[A-Za-z0-9+/._=-]{80,4096}$")
 
@@ -416,6 +468,54 @@ def apply_config():
     result = subprocess.run(["sudo", "/usr/local/sbin/nexushost-panel-apply"], text=True, capture_output=True)
     if result.returncode:
         raise RuntimeError(result.stderr.strip() or "Nginx kunne ikke genindlæses")
+
+def next_app_port(exclude_slug=None):
+    used = {
+        int(site.get("app_port"))
+        for site in load_sites()
+        if site.get("slug") != exclude_slug and isinstance(site.get("app_port"), int)
+    }
+    for port in range(18000, 30000):
+        if port not in used:
+            return port
+    raise RuntimeError("Der er ingen ledige interne app-porte")
+
+def run_app_action(action, slug, app_port=None, github_url=None):
+    if action not in ("deploy", "remove", "delete", "start", "stop"):
+        raise ValueError("Ugyldig app-handling")
+    args = ["sudo", APP_HELPER, action, slug]
+    if action == "deploy":
+        if not isinstance(app_port, int):
+            raise ValueError("Intern app-port mangler")
+        args.append(str(app_port))
+    try:
+        result = subprocess.run(
+            args, input=(github_url or ""), text=True, capture_output=True,
+            timeout=240,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("GitHub-deploy tog for lang tid. Prøv igen.") from exc
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or "App-handlingen fejlede")
+    return result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
+
+def update_site_runtime(slug, runtime, source_url="", app_port=None):
+    sites = load_sites()
+    target = next((item for item in sites if item.get("slug") == slug), None)
+    if target is None:
+        raise ValueError("Websitet findes ikke")
+    target["runtime"] = runtime
+    if runtime == "node":
+        target["app_port"] = int(app_port)
+    else:
+        target.pop("app_port", None)
+    if source_url:
+        target["source_url"] = source_url
+    else:
+        target.pop("source_url", None)
+    target["updated"] = datetime.now(timezone.utc).isoformat()
+    save_sites(sites)
+    return target
 
 def tunnel_state():
     active = subprocess.run(["systemctl", "is-active", "--quiet", TUNNEL_SERVICE]).returncode == 0
@@ -608,7 +708,7 @@ def new_site():
             sites = load_sites()
             if any(x["slug"] == slug for x in sites): raise ValueError("Der findes allerede et website med næsten samme navn")
             now = datetime.now(timezone.utc).isoformat()
-            site = {"name":name,"slug":slug,"port":port,"scope":scope,"domains":domains,"active":True,"created":now,"updated":now}
+            site = {"name":name,"slug":slug,"port":port,"scope":scope,"domains":domains,"active":True,"runtime":"static","created":now,"updated":now}
             public = ROOT / slug / "public"; public.mkdir(parents=True, exist_ok=False)
             (public / "index.html").write_text(f'''<!doctype html><html lang="da"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>{html.escape(name)}</title><style>body{{font:18px system-ui;background:#07111f;color:#eef6ff;display:grid;place-items:center;min-height:100vh;margin:0}}main{{text-align:center}}h1{{font-size:clamp(2rem,8vw,5rem);margin:0}}p{{color:#91a6bd}}</style><main><h1>{html.escape(name)}</h1><p>Dit website er online 🚀</p></main></html>''')
             sites.append(site); save_sites(sites)
@@ -684,16 +784,43 @@ def edit_site(slug):
             elif action == "html":
                 content=request.form.get("content", "")
                 if len(content.encode()) > 1024*1024: raise ValueError("index.html må højst være 1 MB")
-                backup_site(public); index.write_text(content); flash("Forsiden er gemt.")
+                backup_site(public); index.write_text(content)
+                if site.get("runtime") == "node":
+                    run_app_action("remove", slug)
+                    update_site_runtime(slug, "static")
+                    apply_config()
+                flash("Forsiden er gemt.")
             elif action == "upload":
                 upload=request.files.get("zipfile")
                 if not upload or not upload.filename: raise ValueError("Vælg en ZIP-fil")
-                safe_extract(upload, public); flash("Website-filerne er uploadet. Den gamle version er gemt som backup.")
+                safe_extract(upload, public)
+                if site.get("runtime") == "node":
+                    run_app_action("remove", slug)
+                    update_site_runtime(slug, "static")
+                    apply_config()
+                flash("Website-filerne er uploadet. Den gamle version er gemt som backup.")
+            elif action == "github":
+                github_url = request.form.get("github_url", "").strip().rstrip("/")
+                if not GITHUB_RE.fullmatch(github_url):
+                    raise ValueError("Indsæt et offentligt GitHub-link, fx https://github.com/bruger/repository")
+                backup_site(public)
+                app_port = next_app_port(slug)
+                runtime = run_app_action("deploy", slug, app_port, github_url)
+                if runtime not in ("static", "node"):
+                    raise RuntimeError("GitHub-importen returnerede en ukendt website-type")
+                updated = update_site_runtime(
+                    slug, runtime, source_url=github_url,
+                    app_port=app_port if runtime == "node" else None,
+                )
+                apply_config()
+                if runtime == "node" and not updated.get("active", True):
+                    run_app_action("stop", slug)
+                flash("GitHub-repository blev hentet og udgivet som " + ("Node-app." if runtime == "node" else "statisk website."))
             return redirect(url_for("edit_site",slug=slug))
         except (ValueError, RuntimeError, OSError, zipfile.BadZipFile) as exc: flash(str(exc),"error")
     try: content=index.read_text()[:1024*1024]
     except (FileNotFoundError,UnicodeDecodeError): content=""
-    body='''<div class="top"><div><h1>{{ site.name }}</h1><div class="muted">/srv/nexushost-sites/{{ site.slug }}/public</div></div><a class="button secondary" href="{{ url_for('dashboard') }}">← Tilbage</a></div><section class="card"><h2>Indstillinger</h2><form method="post"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><input type="hidden" name="action" value="settings"><div class="form-grid"><div><label>Navn</label><input name="name" value="{{ site.name }}" required></div><div><label>Port</label><input name="port" type="number" min="1024" max="65535" value="{{ site.port }}" required></div></div><label>Domæner</label><input name="domains" value="{{ site.domains|join(', ') }}" placeholder="minside.dk, www.minside.dk"><div class="help">Adskil flere domæner med komma.</div><label>Adgang</label><select name="scope"><option value="lan" {{ 'selected' if site.scope=='lan' }}>Kun lokalt netværk</option><option value="tunnel" {{ 'selected' if site.scope=='tunnel' }}>Offentlig via Cloudflare Tunnel – uden routerporte</option>{% if site.scope=='public' %}<option value="public" selected>Ældre direkte offentlig opsætning – skift til Tunnel</option>{% endif %}</select><button style="margin-top:18px">Gem indstillinger</button></form>{% if site.scope=='tunnel' %}<div class="notice"><b>Cloudflare Service URL:</b><div class="code" style="margin-top:9px">http://localhost:{{ site.port }}</div><p style="margin-bottom:0"><a href="{{ url_for('cloudflare') }}">Åbn tunnelopsætningen →</a></p></div>{% elif site.scope=='public' %}<div class="notice warn"><b>Advarsel:</b> Dette site bruger den ældre direkte offentlige metode. Vælg Cloudflare Tunnel ovenfor, så routerporten kan lukkes.</div>{% endif %}</section><section class="card"><h2>Upload et færdigt website</h2><p class="muted">ZIP-filen skal indeholde en index.html. Maks. 100 MB. Din nuværende version bliver automatisk gemt som backup.</p><form method="post" enctype="multipart/form-data"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><input type="hidden" name="action" value="upload"><input type="file" name="zipfile" accept=".zip" required><button style="margin-top:14px">Upload og udgiv</button></form></section><section class="card"><h2>Redigér index.html</h2><form method="post"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><input type="hidden" name="action" value="html"><textarea name="content" spellcheck="false">{{ content }}</textarea><button style="margin-top:14px">Gem og udgiv</button></form></section>'''
+    body='''<div class="top"><div><h1>{{ site.name }}</h1><div class="muted">/srv/nexushost-sites/{{ site.slug }}/public</div></div><a class="button secondary" href="{{ url_for('dashboard') }}">← Tilbage</a></div><section class="card"><h2>Indstillinger</h2><form method="post"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><input type="hidden" name="action" value="settings"><div class="form-grid"><div><label>Navn</label><input name="name" value="{{ site.name }}" required></div><div><label>Port</label><input name="port" type="number" min="1024" max="65535" value="{{ site.port }}" required></div></div><label>Domæner</label><input name="domains" value="{{ site.domains|join(', ') }}" placeholder="minside.dk, www.minside.dk"><div class="help">Adskil flere domæner med komma.</div><label>Adgang</label><select name="scope"><option value="lan" {{ 'selected' if site.scope=='lan' }}>Kun lokalt netværk</option><option value="tunnel" {{ 'selected' if site.scope=='tunnel' }}>Offentlig via Cloudflare Tunnel – uden routerporte</option>{% if site.scope=='public' %}<option value="public" selected>Ældre direkte offentlig opsætning – skift til Tunnel</option>{% endif %}</select><button style="margin-top:18px">Gem indstillinger</button></form>{% if site.scope=='tunnel' %}<div class="notice"><b>Cloudflare Service URL:</b><div class="code" style="margin-top:9px">http://localhost:{{ site.port }}</div><p style="margin-bottom:0"><a href="{{ url_for('cloudflare') }}">Åbn tunnelopsætningen →</a></p></div>{% elif site.scope=='public' %}<div class="notice warn"><b>Advarsel:</b> Dette site bruger den ældre direkte offentlige metode. Vælg Cloudflare Tunnel ovenfor, så routerporten kan lukkes.</div>{% endif %}</section><section class="card"><h2>Upload et færdigt website</h2><p class="muted">ZIP-filen skal indeholde en index.html. Maks. 100 MB. Din nuværende version bliver automatisk gemt som backup.</p><form method="post" enctype="multipart/form-data"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><input type="hidden" name="action" value="upload"><input type="file" name="zipfile" accept=".zip" required><button style="margin-top:14px">Upload og udgiv</button></form></section><section class="card"><h2>Udgiv fra GitHub</h2><p class="muted">Indsæt linket til et offentligt GitHub-repository. NexusHost finder automatisk ud af, om det er et statisk website eller en Node-app med <b>npm start</b>.</p>{% if site.source_url %}<div class="domain" style="margin-bottom:14px">Kilde: {{ site.source_url }}</div>{% endif %}<form method="post"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><input type="hidden" name="action" value="github"><label>GitHub repository</label><input name="github_url" type="url" placeholder="https://github.com/bruger/repository" required><div class="help">Kun offentlige repositories. Node-apps køres isoleret og starter automatisk efter genstart.</div><div class="notice warn"><b>Importér kun kode du stoler på.</b> En Node-app er rigtig serverkode og bliver kørt på maskinen.</div><button style="margin-top:14px">Hent fra GitHub og udgiv</button></form></section><section class="card"><h2>Redigér index.html</h2><form method="post"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><input type="hidden" name="action" value="html"><textarea name="content" spellcheck="false">{{ content }}</textarea><button style="margin-top:14px">Gem og udgiv</button></form></section>'''
     return page(site["name"], body, site=site, content=content)
 
 @app.post("/sites/<slug>/toggle")
@@ -702,11 +829,19 @@ def toggle_site(slug):
     sites=load_sites(); site=next((x for x in sites if x["slug"]==slug),None)
     if not site: abort(404)
     site["active"]=not site["active"]; site["updated"]=datetime.now(timezone.utc).isoformat(); save_sites(sites)
-    try: apply_config(); flash("Websitet er nu " + ("online." if site["active"] else "stoppet."))
+    try:
+        apply_config()
+        if site.get("runtime") == "node":
+            run_app_action("start" if site["active"] else "stop", slug)
+        flash("Websitet er nu " + ("online." if site["active"] else "stoppet."))
     except RuntimeError as exc:
         site["active"]=not site["active"]; save_sites(sites)
-        try: apply_config()
-        except RuntimeError: pass
+        try:
+            apply_config()
+            if site.get("runtime") == "node":
+                run_app_action("start" if site["active"] else "stop", slug)
+        except RuntimeError:
+            pass
         flash(str(exc),"error")
     return redirect(url_for("dashboard"))
 
@@ -721,6 +856,8 @@ def delete_site(slug):
         try: apply_config()
         except Exception:
             sites.append(site); save_sites(sites); apply_config(); raise
+        if site.get("runtime") == "node":
+            run_app_action("delete", slug)
         shutil.rmtree(folder,ignore_errors=True); flash("Websitet blev fjernet. En ZIP-backup er gemt på serveren.")
     except (RuntimeError,OSError) as exc: flash(str(exc),"error")
     return redirect(url_for("dashboard"))
@@ -874,6 +1011,7 @@ EOF
 
 cat > /etc/sudoers.d/nexushost-webpanel <<EOF
 ${PANEL_USER} ALL=(root) NOPASSWD: /usr/local/sbin/nexushost-panel-apply, /usr/local/sbin/nexushost-tunnel-control install, /usr/local/sbin/nexushost-tunnel-control restart, /usr/local/sbin/nexushost-tunnel-control disconnect
+${PANEL_USER} ALL=(root) NOPASSWD: /usr/local/sbin/nexushost-app-control *
 EOF
 chmod 0440 /etc/sudoers.d/nexushost-webpanel
 
@@ -881,6 +1019,10 @@ echo "[6/7] Tester opsætningen..."
 /usr/sbin/visudo -cf /etc/sudoers.d/nexushost-webpanel
 python3 -m py_compile "$PANEL_HOME/app.py" /usr/local/sbin/nexushost-panel-apply
 bash -n /usr/local/sbin/nexushost-tunnel-control
+bash -n /usr/local/sbin/nexushost-app-control
+node -e 'if (Number(process.versions.node.split(".")[0]) < 20) process.exit(1)'
+npm --version >/dev/null
+git --version >/dev/null
 python3 -c 'import flask, gunicorn, werkzeug'
 CLOUDFLARED_HELP="$("$CLOUDFLARED_BIN" tunnel run --help 2>&1)"
 if [[ "$CLOUDFLARED_HELP" != *"--token-file"* ]]; then
