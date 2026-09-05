@@ -49,19 +49,38 @@ fi
 
 echo "[1/7] Installerer Nginx, Python og nødvendige pakker..."
 apt-get update
-apt-get install -y nginx python3 python3-flask python3-gunicorn unzip openssl curl ca-certificates sudo git nodejs npm
+apt-get install -y nginx python3 python3-flask python3-gunicorn unzip openssl curl ca-certificates sudo git
 
-NODE_MAJOR="$(node -p "Number(process.versions.node.split('.')[0])" 2>/dev/null || echo 0)"
+NODE_MAJOR=0
+if command -v node >/dev/null 2>&1; then
+  NODE_MAJOR="$(node -p "Number(process.versions.node.split('.')[0])" 2>/dev/null || echo 0)"
+fi
+
 if (( NODE_MAJOR < 20 )); then
   echo "Installerer Node.js 22 LTS til GitHub/Node-apps..."
+
+  # Undgå at blande Ubuntus separate nodejs/npm-pakker med NodeSources samlede Node-pakke.
+  # Gamle distro-pakker kan ellers give APT dependency-konflikter under opgraderingen.
+  apt-get remove -y nodejs npm libnode-dev >/dev/null 2>&1 || true
+  apt-get autoremove -y >/dev/null 2>&1 || true
+
+  rm -f /etc/apt/sources.list.d/nodesource.list /etc/apt/sources.list.d/nodesource.sources
   curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+  apt-get update
   apt-get install -y nodejs
 fi
+
 NODE_MAJOR="$(node -p "Number(process.versions.node.split('.')[0])" 2>/dev/null || echo 0)"
 if (( NODE_MAJOR < 20 )); then
   echo "FEJL: NexusHost kræver Node.js 20+ for at kunne deploye Node-apps fra GitHub."
   exit 1
 fi
+
+if ! command -v npm >/dev/null 2>&1; then
+  echo "FEJL: Node.js blev installeret uden npm. Prøv installationen igen."
+  exit 1
+fi
+echo "Node.js fundet: $(node --version) / npm $(npm --version)"
 if [[ -z "$ADMIN_PASSWORD" ]]; then
   ADMIN_PASSWORD="$(openssl rand -base64 24 | tr -d '\n' | tr '/+' 'xy')"
 fi
