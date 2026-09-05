@@ -290,7 +290,8 @@ server {{
     client_max_body_size 100m;
     server_tokens off;
     add_header X-Content-Type-Options "nosniff" always;
-    add_header Referrer-Policy "strict-origin-when-cross-origin" always;{access}
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header X-NexusHost-Runtime "{runtime}" always;{access}
 {location}
     location ~ /\\. {{ deny all; }}
 }}
@@ -543,6 +544,29 @@ def update_site_runtime(slug, runtime, source_url="", app_port=None):
     save_sites(sites)
     return target
 
+def verify_site_route(site, expected_runtime):
+    port = int(site["port"])
+    try:
+        result = subprocess.run(
+            ["curl", "--silent", "--show-error", "--head", "--max-time", "6",
+             f"http://127.0.0.1:{port}/"],
+            text=True, capture_output=True, timeout=8,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Websitet blev deployet, men NexusHost kunne ikke kontrollere den offentlige route.") from exc
+    if result.returncode:
+        raise RuntimeError("Websitet blev deployet, men den offentlige website-port svarer ikke endnu.")
+    marker = ""
+    for line in result.stdout.splitlines():
+        if line.lower().startswith("x-nexushost-runtime:"):
+            marker = line.split(":", 1)[1].strip().lower()
+            break
+    if marker != expected_runtime:
+        raise RuntimeError(
+            f"Deploy blev gemt som {expected_runtime}, men Nginx serverer stadig {marker or 'en gammel konfiguration'}. "
+            "Genstart NexusHost og prøv GitHub-deploy igen."
+        )
+
 def tunnel_state():
     active = subprocess.run(["systemctl", "is-active", "--quiet", TUNNEL_SERVICE]).returncode == 0
     enabled = subprocess.run(["systemctl", "is-enabled", "--quiet", TUNNEL_SERVICE],
@@ -655,6 +679,8 @@ def dashboard():
         scope = site.get("scope", "lan")
         site["scope_label"] = {"lan":"Kun netværk", "tunnel":"Cloudflare", "public":"Direkte offentlig"}.get(scope, "Ukendt")
         site["scope_class"] = {"lan":"lan", "tunnel":"tunnel", "public":"direct"}.get(scope, "off")
+        runtime = site.get("runtime", "static")
+        site["runtime_label"] = "Node app" if runtime == "node" else "Statisk"
         if site.get("domains"):
             scheme = "https" if scope == "tunnel" else "http"
             site["open_url"] = f"{scheme}://{site['domains'][0]}"
@@ -664,7 +690,7 @@ def dashboard():
     body = '''<div class="top"><div><h1>Dine websites</h1><div class="muted">Administrér alt fra ét sted</div></div><a class="button" href="{{ url_for('new_site') }}">＋ Nyt website</a></div>
     <div class="grid"><div class="stat"><span class="muted">Websites</span><div class="big">{{ sites|length }}</div></div><div class="stat"><span class="muted">Online</span><div class="big">{{ sites|selectattr('active')|list|length }}</div></div><div class="stat"><span class="muted">Server-IP</span><div class="big" style="font-size:18px">{{ ip }}</div></div><div class="stat"><span class="muted">Sikker tunnel</span><div class="big" style="font-size:18px">{{ 'Forbundet' if state.active else 'Ikke forbundet' }}</div></div></div>
     {% if tunnel_sites and not state.active %}<div class="notice warn"><b>Cloudflare Tunnel er ikke forbundet.</b> Dine Cloudflare-websites virker kun lokalt endnu. <a href="{{ url_for('cloudflare') }}">Forbind tunnelen →</a></div>{% endif %}
-    <div class="sites">{% for s in sites %}<article class="site"><div class="row"><div><h3>{{ s.name }}</h3><span class="muted">Port {{ s.port }}</span></div><span class="pill {{ 'on' if s.active else 'off' }}">{{ 'ONLINE' if s.active else 'STOPPET' }}</span></div><div class="domain">{% if s.domains %}{{ s.domains|join(', ') }}{% else %}{{ ip }}:{{ s.port }}{% endif %}</div><div class="row"><span class="pill {{ s.scope_class }}">{{ s.scope_label }}</span><span class="muted">{{ s.updated[:10] }}</span></div><div class="actions"><a class="button secondary" href="{{ url_for('edit_site', slug=s.slug) }}">Redigér</a><a class="button secondary" href="{{ s.open_url }}" target="_blank" rel="noopener">Åbn</a><form method="post" action="{{ url_for('toggle_site', slug=s.slug) }}"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><button class="secondary">{{ 'Stop' if s.active else 'Start' }}</button></form><form method="post" action="{{ url_for('delete_site', slug=s.slug) }}" onsubmit="return confirm('Flyt websitet til backup og fjern det?')"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><button class="danger">Slet</button></form></div></article>{% else %}<div class="card empty"><h2>Ingen websites endnu</h2><p>Opret dit første website på under ét minut.</p><a class="button" href="{{ url_for('new_site') }}">Opret website</a></div>{% endfor %}</div>'''
+    <div class="sites">{% for s in sites %}<article class="site"><div class="row"><div><h3>{{ s.name }}</h3><span class="muted">Port {{ s.port }}</span></div><span class="pill {{ 'on' if s.active else 'off' }}">{{ 'ONLINE' if s.active else 'STOPPET' }}</span></div><div class="domain">{% if s.domains %}{{ s.domains|join(', ') }}{% else %}{{ ip }}:{{ s.port }}{% endif %}</div><div class="row"><div><span class="pill {{ s.scope_class }}">{{ s.scope_label }}</span> <span class="pill {{ 'on' if s.runtime_label=='Node app' else 'lan' }}">{{ s.runtime_label }}</span></div><span class="muted">{{ s.updated[:10] }}</span></div><div class="actions"><a class="button secondary" href="{{ url_for('edit_site', slug=s.slug) }}">Redigér</a><a class="button secondary" href="{{ s.open_url }}" target="_blank" rel="noopener">Åbn</a><form method="post" action="{{ url_for('toggle_site', slug=s.slug) }}"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><button class="secondary">{{ 'Stop' if s.active else 'Start' }}</button></form><form method="post" action="{{ url_for('delete_site', slug=s.slug) }}" onsubmit="return confirm('Flyt websitet til backup og fjern det?')"><input type="hidden" name="csrf" value="{{ csrf_token() }}"><button class="danger">Slet</button></form></div></article>{% else %}<div class="card empty"><h2>Ingen websites endnu</h2><p>Opret dit første website på under ét minut.</p><a class="button" href="{{ url_for('new_site') }}">Opret website</a></div>{% endfor %}</div>'''
     return page("Websites", body, sites=sites, ip=ip, state=state, tunnel_sites=tunnel_sites)
 
 @app.route("/cloudflare", methods=["GET", "POST"])
@@ -852,6 +878,8 @@ def edit_site(slug):
                 apply_config()
                 if runtime == "node" and not updated.get("active", True):
                     run_app_action("stop", slug)
+                if updated.get("active", True):
+                    verify_site_route(updated, runtime)
                 flash("GitHub-repository blev hentet og udgivet som " + ("Node-app." if runtime == "node" else "statisk website."))
             return redirect(url_for("edit_site",slug=slug))
         except (ValueError, RuntimeError, OSError, zipfile.BadZipFile) as exc: flash(str(exc),"error")
