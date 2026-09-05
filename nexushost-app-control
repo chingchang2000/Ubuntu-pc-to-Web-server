@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT="/srv/nexushost-sites"
+PANEL_USER="nexushost-panel"
+ACTION="${1:-}"
+SLUG="${2:-}"
+APP_PORT="${3:-}"
+
+fail() {
+  echo "FEJL: $1" >&2
+  exit 1
+}
+
+[[ "${EUID}" -eq 0 ]] || fail "Denne hjælper skal køres som root"
+[[ "${SLUG}" =~ ^[a-z0-9][a-z0-9-]{0,48}$ ]] || fail "Ugyldigt website-id"
+
+SITE_DIR="${ROOT}/${SLUG}"
+APP_DIR="${SITE_DIR}/app"
+PUBLIC_DIR="${SITE_DIR}/public"
+UNIT="/etc/systemd/system/nexushost-app-${SLUG}.service"
+SERVICE="nexushost-app-${SLUG}.service"
+
+remove_runtime() {
+  systemctl disable --now "${SERVICE}" >/dev/null 2>&1 || true
+  rm -f -- "${UNIT}"
+  systemctl daemon-reload
+  rm -rf -- "${APP_DIR}"
+}
+
+validate_port() {
+  [[ "${APP_PORT}" =~ ^[0-9]+$ ]] || fail "Ugyldig intern app-port"
+  (( APP_PORT >= 18000 && APP_PORT <= 29999 )) || fail "Intern app-port skal være mellem 18000 og 29999"
+}
+
+case "${ACTION}" in
+  deploy)
+    validate_port
+    URL="$(head -c 1025)"
+    [[ "${URL}" =~ ^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(\.git)?$ ]] ||
+      fail "Brug et offentligt GitHub-link som https://github.com/bruger/repository"
+
+    install -d -o "${PANEL_USER}" -g "${PANEL_USER}" -m 0755 "${SITE_DIR}"
+    STAGE="${SITE_DIR}/.github-$(date +%s)-$$"
+    trap 'rm -rf -- "${STAGE:-}"' EXIT
+
+    if ! runuser -u "${PANEL_USER}" -- git clone --depth 1 --no-tags --single-branch "${URL}" "${STAGE}" >/dev/null 2>&1; then
+      fail "GitHub-repository kunne ikke hentes. Kontrollér at linket er offentligt og korrekt."
+    fi
+    rm -rf -- "${STAGE}/.git"
+
+    SIZE_MB="$(du -sm "${STAGE}" | awk '{print $1}')"
+    (( SIZE_MB <= 600 )) || fail "Repository er for stort (maks. 600 MB)"
+    if find "${STAGE}" -type l -print -quit | grep -q .; then
+      fail "Repository indeholder symbolske links og kan derfor ikke importeres sikkert"
+    fi
+
+    IS_NODE=false
+    if [[ -f "${STAGE}/package.json" ]] && python3 - "${STAGE}/package.json" <<'PY' >/dev/null 2>&1
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f:
+    package = json.load(f)
+start = package.get("scripts", {}).get("start")
+raise SystemExit(0 if isinstance(start, str) and start.strip() else 1)
+PY
+    then
+      IS_NODE=true
+    fi
+
+    if [[ "${IS_NODE}" == true ]]; then
+      command -v node >/dev/null 2>&1 || fail "Node.js mangler på serveren"
+      command -v npm >/dev/null 2>&1 || fail "npm mangler på serveren"
+      NODE_MAJOR="$(node -p "Number(process.versions.node.split('.')[0])")"
+      (( NODE_MAJOR >= 20 )) || fail "Node.js 20 eller nyere er nødvendig for Node-apps"
+
+      remove_runtime
+      mv -- "${STAGE}" "${APP_DIR}"
+      trap - EXIT
+      chown -R "${PANEL_USER}:${PANEL_USER}" "${APP_DIR}"
+
+      if ! runuser -u "${PANEL_USER}" -- bash -lc "cd '${APP_DIR}' && npm install --omit=dev --ignore-scripts --no-audit --no-fund" >/dev/null 2>&1; then
+        rm -rf -- "${APP_DIR}"
+        fail "npm install fejlede. Repository kunne ikke deployes."
+      fi
+
+      NPM_BIN="$(command -v npm)"
+      cat > "${UNIT}" <<EOF
+[Unit]
+Description=NexusHost app ${SLUG}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+WorkingDirectory=${APP_DIR}
+Environment=NODE_ENV=production
+Environment=HOST=127.0.0.1
+Environment=PORT=${APP_PORT}
+Environment=HOME=/tmp
+ExecStart=${NPM_BIN} start
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=15
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+InaccessiblePaths=/var/lib/nexushost-webpanel /etc/nexushost /opt/nexushost-webpanel
+
+[Install]
+WantedBy=multi-user.target
+EOF
+      chmod 0644 "${UNIT}"
+      systemctl daemon-reload
+      systemctl enable --now "${SERVICE}"
+
+      READY=false
+      for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+        if curl --silent --output /dev/null --max-time 2 "http://127.0.0.1:${APP_PORT}/"; then
+          READY=true
+          break
+        fi
+        sleep 1
+      done
+      if [[ "${READY}" != true ]]; then
+        journalctl -u "${SERVICE}" --no-pager -n 20 >&2 || true
+        remove_runtime
+        fail "Node-appen startede ikke korrekt. Se loggen i NexusHost/serverloggen."
+      fi
+      echo "node"
+      exit 0
+    fi
+
+    SOURCE=""
+    for candidate in "${STAGE}" "${STAGE}/public" "${STAGE}/docs"; do
+      if [[ -f "${candidate}/index.html" ]]; then
+        SOURCE="${candidate}"
+        break
+      fi
+    done
+    [[ -n "${SOURCE}" ]] || fail "Repository skal enten have index.html eller package.json med et start-script"
+
+    remove_runtime
+    NEW_PUBLIC="${SITE_DIR}/.public-new-$$"
+    rm -rf -- "${NEW_PUBLIC}"
+    mkdir -p "${NEW_PUBLIC}"
+    cp -a "${SOURCE}/." "${NEW_PUBLIC}/"
+    rm -rf -- "${PUBLIC_DIR}"
+    mv -- "${NEW_PUBLIC}" "${PUBLIC_DIR}"
+    chown -R "${PANEL_USER}:${PANEL_USER}" "${PUBLIC_DIR}"
+    chmod -R u=rwX,go=rX "${PUBLIC_DIR}"
+    rm -rf -- "${STAGE}"
+    trap - EXIT
+    echo "static"
+    ;;
+
+  remove|delete)
+    remove_runtime
+    ;;
+
+  start)
+    [[ -f "${UNIT}" ]] || fail "Node-servicen findes ikke"
+    systemctl enable --now "${SERVICE}"
+    ;;
+
+  stop)
+    systemctl disable --now "${SERVICE}" >/dev/null 2>&1 || true
+    ;;
+
+  *)
+    fail "Tilladt handling er deploy, remove, delete, start eller stop"
+    ;;
+esac
