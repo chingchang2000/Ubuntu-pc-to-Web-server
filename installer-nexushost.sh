@@ -61,8 +61,7 @@ if (( NODE_MAJOR < 20 )); then
 
   # Undgå at blande Ubuntus separate nodejs/npm-pakker med NodeSources samlede Node-pakke.
   # Gamle distro-pakker kan ellers give APT dependency-konflikter under opgraderingen.
-  apt-get remove -y nodejs npm libnode-dev >/dev/null 2>&1 || true
-  apt-get autoremove -y >/dev/null 2>&1 || true
+  apt-get remove -y npm libnode-dev >/dev/null 2>&1 || true
 
   rm -f /etc/apt/sources.list.d/nodesource.list /etc/apt/sources.list.d/nodesource.sources
   curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
