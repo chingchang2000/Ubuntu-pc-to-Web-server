@@ -499,7 +499,7 @@ def next_app_port(exclude_slug=None):
     raise RuntimeError("Der er ingen ledige interne app-porte")
 
 def run_app_action(action, slug, app_port=None, github_url=None):
-    if action not in ("deploy", "remove", "delete", "start", "stop"):
+    if action not in ("deploy", "remove", "delete", "start", "restart", "stop"):
         raise ValueError("Ugyldig app-handling")
     args = ["sudo", APP_HELPER, action, slug]
     if action == "deploy":
@@ -516,6 +516,14 @@ def run_app_action(action, slug, app_port=None, github_url=None):
     if result.returncode:
         raise RuntimeError(result.stderr.strip() or "App-handlingen fejlede")
     return result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
+
+def write_app_env(slug, site_name):
+    safe_name = str(site_name).replace("\r", " ").replace("\n", " ").replace("\\", "\\\\").replace('"', '\\"')
+    site_dir = ROOT / slug
+    site_dir.mkdir(parents=True, exist_ok=True)
+    env_file = site_dir / "app.env"
+    env_file.write_text(f'SITE_NAME="{safe_name}"\n', encoding="utf-8")
+    os.chmod(env_file, 0o644)
 
 def update_site_runtime(slug, runtime, source_url="", app_port=None):
     sites = load_sites()
@@ -796,8 +804,18 @@ def edit_site(slug):
                 name, _, port, scope, domains = validate_site_form(slug)
                 old = dict(site); site.update(name=name,port=port,scope=scope,domains=domains,updated=datetime.now(timezone.utc).isoformat())
                 sites=load_sites(); sites[sites.index(next(x for x in sites if x["slug"]==slug))]=site; save_sites(sites)
-                try: apply_config()
-                except Exception: sites[sites.index(site)]=old; save_sites(sites); apply_config(); raise
+                try:
+                    apply_config()
+                    if site.get("runtime") == "node":
+                        write_app_env(slug, site["name"])
+                        if site.get("active", True):
+                            run_app_action("restart", slug)
+                except Exception:
+                    sites[sites.index(site)]=old
+                    save_sites(sites)
+                    try: apply_config()
+                    except Exception: pass
+                    raise
                 flash("Indstillingerne er gemt.")
             elif action == "html":
                 content=request.form.get("content", "")
@@ -823,6 +841,7 @@ def edit_site(slug):
                     raise ValueError("Indsæt et offentligt GitHub-link, fx https://github.com/bruger/repository")
                 backup_site(public)
                 app_port = next_app_port(slug)
+                write_app_env(slug, site["name"])
                 runtime = run_app_action("deploy", slug, app_port, github_url)
                 if runtime not in ("static", "node"):
                     raise RuntimeError("GitHub-importen returnerede en ukendt website-type")
